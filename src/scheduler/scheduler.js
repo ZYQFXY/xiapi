@@ -3,13 +3,22 @@ const logger = require('../utils/logger');
 const taskQueue = require('../queue/taskQueue');
 const { pullTasks } = require('../services/pullService');
 const { querySingle } = require('../services/queryService');
-const { callbackSingle, addToRetryQueue, processRetryQueue, getTotalSuccessCount } = require('../services/callbackService');
+const {
+  addToCallbackQueue,
+  processCallbackQueue,
+  processRetryQueue,
+  getTotalSuccessCount,
+  getCallbackQueueLength,
+  getRetryQueueLength,
+} = require('../services/callbackService');
 
 let pullTimer = null;
-let batchTimer = null;
+let queryTimer = null;
+let callbackProcessTimer = null;
 let cleanupTimer = null;
 let callbackRetryTimer = null;
-let batchRunning = false;
+let queryRunning = false;
+let callbackRunning = false;
 let sleeping = false;
 
 /**
@@ -28,31 +37,7 @@ function enterSleepMode() {
 }
 
 /**
- * 处理单个任务：查询 → 立刻回调
- * @returns {string} 'callbackOk' | 'callbackFail' | 'retry'
- */
-async function processOneTask(task) {
-  // 查询
-  const result = await querySingle(task);
-
-  if (!result.success) {
-    // 需要重试（code 1000000 或网络异常）
-    return 'retry';
-  }
-
-  // 查询有结果，立刻回调
-  const ok = await callbackSingle(task, result.data);
-  if (ok) {
-    return 'callbackOk';
-  } else {
-    // 回调失败，加入重试队列
-    addToRetryQueue(task, result.data);
-    return 'callbackFail';
-  }
-}
-
-/**
- * 拉取循环：每5秒从上游拉取任务
+ * 拉取循环：从上游拉取任务
  */
 async function pullLoop() {
   try {
@@ -66,12 +51,12 @@ async function pullLoop() {
 }
 
 /**
- * 批量处理循环
- * 每个任务：查询 → 立刻回调，并发执行
+ * 查询循环（独立管道）：
+ * 从 taskQueue 取出任务 → 查询 tokege → 成功结果推入 callbackQueue，失败重入 taskQueue
  */
-async function batchLoop() {
-  if (batchRunning) {
-    logger.debug('批量处理正在执行中，跳过本次检查');
+async function queryLoop() {
+  if (queryRunning) {
+    logger.debug('查询管道正在执行中，跳过本次');
     return;
   }
 
@@ -84,54 +69,71 @@ async function batchLoop() {
 
   if (sleeping) {
     if (pending === 0) {
-      logger.debug('休眠模式: 队列已空，等待回调重试完成');
+      logger.debug('休眠模式: 任务队列已空');
       return;
     }
   } else {
     if (pending < config.scheduler.batchSize) {
-      logger.debug(`队列 ${pending}/${config.scheduler.batchSize}，未达阈值`);
+      logger.debug(`任务队列 ${pending}/${config.scheduler.batchSize}，未达阈值`);
       return;
     }
   }
 
-  batchRunning = true;
+  queryRunning = true;
   try {
     const count = sleeping ? pending : config.scheduler.batchSize;
     const tasks = taskQueue.dequeue(count);
-    logger.info(`开始批量处理: ${tasks.length} 条任务${sleeping ? ' (休眠模式)' : ''}`);
+    logger.info(`[查询管道] 开始: ${tasks.length} 条任务${sleeping ? ' (休眠模式)' : ''}`);
 
     const concurrency = config.scheduler.queryConcurrency;
-    let callbackOk = 0;
-    let callbackFail = 0;
+    let queryOk = 0;
     const retryTasks = [];
 
-    // 按并发数分批，每个任务查询完立刻回调
     for (let i = 0; i < tasks.length; i += concurrency) {
       const batch = tasks.slice(i, i + concurrency);
-      const results = await Promise.all(batch.map(task => processOneTask(task)));
+      const results = await Promise.all(batch.map(task => querySingle(task)));
 
-      for (let j = 0; j < results.length; j++) {
-        if (results[j] === 'callbackOk') callbackOk++;
-        else if (results[j] === 'callbackFail') callbackFail++;
-        else retryTasks.push(batch[j]); // retry
+      for (const result of results) {
+        if (result.success) {
+          addToCallbackQueue(result.task, result.data);
+          queryOk++;
+        } else {
+          retryTasks.push(result.task);
+        }
       }
     }
 
-    // 需要重试的任务重入队
     if (retryTasks.length > 0) {
       taskQueue.requeue(retryTasks);
     }
 
-    logger.info(`批量处理完成: 回调成功=${callbackOk} 回调失败=${callbackFail} 重试=${retryTasks.length}`);
+    logger.info(`[查询管道] 完成: 查询成功=${queryOk} 重试=${retryTasks.length} 回调队列=${getCallbackQueueLength()}`);
+  } catch (err) {
+    logger.error(`queryLoop 异常: ${err.message}`);
+  } finally {
+    queryRunning = false;
+  }
+}
 
-    // 检查是否刚触发休眠阈值
+/**
+ * 回调处理循环（独立管道）：
+ * 从 callbackQueue 取出结果 → 回调上游，失败进入重试队列
+ */
+async function callbackProcessLoop() {
+  if (callbackRunning) return;
+
+  callbackRunning = true;
+  try {
+    await processCallbackQueue();
+
+    // 回调后检查休眠
     if (!sleeping && getTotalSuccessCount() >= config.scheduler.callbackSuccessLimit) {
       enterSleepMode();
     }
   } catch (err) {
-    logger.error(`batchLoop 异常: ${err.message}`);
+    logger.error(`callbackProcessLoop 异常: ${err.message}`);
   } finally {
-    batchRunning = false;
+    callbackRunning = false;
   }
 }
 
@@ -146,7 +148,7 @@ function cleanupLoop() {
 }
 
 /**
- * 回调重试循环：每10秒处理失败的回调
+ * 回调重试循环：处理失败的回调
  */
 async function callbackRetryLoop() {
   try {
@@ -161,13 +163,15 @@ async function callbackRetryLoop() {
  */
 function start() {
   logger.info('调度器启动');
-  logger.info(`配置: 拉取间隔=${config.scheduler.pullInterval}ms 批量阈值=${config.scheduler.batchSize} 回调成功上限=${config.scheduler.callbackSuccessLimit} 超时=${config.scheduler.taskTimeout}ms`);
+  logger.info(`配置: 拉取=${config.scheduler.pullSize}条/${config.scheduler.pullInterval}ms 查询并发=${config.scheduler.queryConcurrency} 回调并发=${config.scheduler.callbackConcurrency} 批量阈值=${config.scheduler.batchSize} 休眠阈值=${config.scheduler.callbackSuccessLimit} 超时=${config.scheduler.taskTimeout}ms`);
 
   pullTimer = setInterval(pullLoop, config.scheduler.pullInterval);
-  batchTimer = setInterval(batchLoop, config.scheduler.batchCheckInterval);
+  queryTimer = setInterval(queryLoop, config.scheduler.batchCheckInterval);
+  callbackProcessTimer = setInterval(callbackProcessLoop, config.scheduler.callbackProcessInterval);
   cleanupTimer = setInterval(cleanupLoop, config.scheduler.cleanupInterval);
   callbackRetryTimer = setInterval(callbackRetryLoop, config.scheduler.callbackRetryInterval);
 
+  // 立即执行第一次拉取
   pullLoop();
 }
 
@@ -176,11 +180,13 @@ function start() {
  */
 function stop() {
   if (pullTimer) clearInterval(pullTimer);
-  if (batchTimer) clearInterval(batchTimer);
+  if (queryTimer) clearInterval(queryTimer);
+  if (callbackProcessTimer) clearInterval(callbackProcessTimer);
   if (cleanupTimer) clearInterval(cleanupTimer);
   if (callbackRetryTimer) clearInterval(callbackRetryTimer);
   pullTimer = null;
-  batchTimer = null;
+  queryTimer = null;
+  callbackProcessTimer = null;
   cleanupTimer = null;
   callbackRetryTimer = null;
   sleeping = false;

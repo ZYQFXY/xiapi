@@ -1,6 +1,6 @@
 const express = require('express');
 const taskQueue = require('../queue/taskQueue');
-const { getRetryQueueLength, getTotalSuccessCount } = require('../services/callbackService');
+const { getRetryQueueLength, getTotalSuccessCount, getCallbackQueueLength } = require('../services/callbackService');
 
 const router = express.Router();
 
@@ -13,6 +13,7 @@ router.get('/health', (req, res) => {
 router.get('/stats', (req, res) => {
   res.json({
     queue: taskQueue.getStats(),
+    callbackQueue: getCallbackQueueLength(),
     callbackRetryQueue: getRetryQueueLength(),
     callbackTotalSuccess: getTotalSuccessCount(),
     memory: process.memoryUsage(),
