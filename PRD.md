@@ -9,7 +9,8 @@ xiapi 是一个数据中转 API 服务，作为桥梁连接上游任务分发系
 定时拉取商品任务 → 内存队列缓冲 → 查询商品详情 → 立即回调上报
 
 ### 1.3 项目地址
-D:\闲鱼开发\xiapi
+- **本地开发**：D:\闲鱼开发\xiapi
+- **云服务器部署**：D:\projects\xiapi（Windows Server）
 
 ---
 
@@ -557,3 +558,154 @@ xiapi/
 8. 实现 `scheduler.js` — 串联全部流程（查询→立即回调 + 休眠模式）
 9. 实现 `index.js` + `routes.js` — 启动完整服务
 10. 端到端测试，调整并发参数
+
+---
+
+## 11. 部署与运维
+
+### 11.1 部署环境
+
+**云服务器配置：**
+- 操作系统：Windows Server
+- Node.js 版本：v24.13.1
+- 进程管理：PM2
+- 远程管理：ToDesk
+
+**部署路径：**
+- 项目目录：`D:\projects\xiapi`
+- 日志目录：`D:\projects\xiapi\logs`
+- PM2 配置：`ecosystem.config.js`
+
+### 11.2 部署步骤
+
+1. **环境准备**
+   ```bash
+   # 安装 Node.js（v18 或更高版本）
+   # 安装 PM2
+   npm install -g pm2
+   npm install -g pm2-windows-startup
+   pm2-startup install
+   ```
+
+2. **上传项目文件**
+   - 通过 ToDesk 复制项目文件到 `D:\projects\xiapi`
+   - 或使用 Git 克隆仓库
+
+3. **配置环境变量**
+   ```bash
+   cd D:\projects\xiapi
+   copy .env.example .env
+   notepad .env
+   ```
+   修改必要配置：
+   - `UPSTREAM_TOKEN`
+   - `TOKEGE_TOKEN`
+   - `PORT`（默认 3000）
+
+4. **安装依赖并启动**
+   ```bash
+   npm install --production
+   pm2 start ecosystem.config.js
+   pm2 save
+   ```
+
+### 11.3 服务管理
+
+**常用命令：**
+```bash
+pm2 status              # 查看服务状态
+pm2 logs xiapi          # 查看实时日志
+pm2 restart xiapi       # 重启服务
+pm2 stop xiapi          # 停止服务
+pm2 monit               # 实时监控
+```
+
+**更新部署：**
+```bash
+cd D:\projects\xiapi
+# 上传新代码覆盖
+pm2 restart xiapi
+```
+
+### 11.4 监控与日志
+
+**日志位置：**
+- 应用日志：`D:\projects\xiapi\logs\`
+- PM2 日志：`C:\Users\Administrator\.pm2\logs\`
+
+**查看日志：**
+```bash
+pm2 logs xiapi --lines 100    # 查看最近 100 行
+pm2 logs xiapi --err          # 只看错误日志
+pm2 flush                     # 清空日志
+```
+
+### 11.5 故障排查
+
+**服务无法启动：**
+```bash
+pm2 logs xiapi --err          # 查看错误日志
+node src/index.js             # 手动测试启动
+```
+
+**端口被占用：**
+```bash
+netstat -ano | findstr :3000  # 查看端口占用
+taskkill /PID <进程ID> /F     # 结束进程
+```
+
+**内存占用过高：**
+- 查看 `pm2 status` 中的 memory 列
+- 修改 `ecosystem.config.js` 中的 `max_memory_restart` 参数
+
+### 11.6 安全建议
+
+- ✅ 不要将 `.env` 文件提交到 Git
+- ✅ 定期更新 Node.js 和依赖包
+- ✅ 配置强密码保护服务器
+- ✅ 定期备份配置文件
+- ✅ 本地使用无需开放防火墙端口
+
+### 11.7 开机自启
+
+PM2 已配置开机自启，服务器重启后会自动启动服务。
+
+**验证自启配置：**
+```bash
+pm2 startup               # 查看启动配置
+pm2 save                  # 保存当前进程列表
+```
+
+### 11.8 相关文档
+
+- **部署指南**：`部署指南.md`（Linux 服务器）
+- **Windows 部署指南**：`Windows部署指南.md`（Windows Server）
+- **管理手册**：`云服务器管理手册.md`（日常运维操作）
+
+---
+
+## 12. 项目状态
+
+### 12.1 开发进度
+
+- ✅ 核心功能实现完成
+- ✅ 本地开发测试通过
+- ✅ 云服务器部署完成
+- ✅ PM2 进程管理配置完成
+- ✅ 开机自启配置完成
+- ✅ 部署文档编写完成
+
+### 12.2 部署信息
+
+- **部署时间**：2026-02-14
+- **部署环境**：Windows Server（通过 ToDesk 管理）
+- **运行状态**：online
+- **访问方式**：本地访问 `http://localhost:3000`
+
+### 12.3 后续优化
+
+- [ ] 添加健康检查接口
+- [ ] 添加性能监控指标
+- [ ] 优化日志输出格式
+- [ ] 添加告警机制
+- [ ] 配置日志轮转
