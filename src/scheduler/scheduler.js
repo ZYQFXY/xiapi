@@ -4,29 +4,30 @@ const taskQueue = require('../queue/taskQueue');
 const { pullSingleTask } = require('../services/pullService');
 const { querySingle } = require('../services/queryService');
 const {
-  addToCallbackQueue,
-  processCallbackQueue,
-  processRetryQueue,
+  callbackSingle,
   getTotalSuccessCount,
-  getCallbackQueueLength,
   getRetryQueueLength,
+  processRetryQueue,
 } = require('../services/callbackService');
 
-let callbackProcessTimer = null;
 let cleanupTimer = null;
 let callbackRetryTimer = null;
 let statsTimer = null;
-let callbackRunning = false;
 let sleeping = false;
 let workersStopped = false;
 let activePullWorkers = 0;
 let activeQueryWorkers = 0;
+let activeCallbackWorkers = 0;
+
+// 回调队列（scheduler 内部管理）
+const callbackQueue = [];
 
 // 吞吐量统计
 let statsLastTime = Date.now();
 let statsLastSuccess = 0;
 let pullCount = 0;
 let pullDupCount = 0;
+let querySkipCount = 0;
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -43,7 +44,6 @@ function enterSleepMode() {
 
 /**
  * 拉取工作线程：串行拉取，避免并发竞争同一个任务
- * 每个 worker 独立循环：拉取 → 入队 → 立即拉取下一个
  */
 async function pullWorker(workerId) {
   activePullWorkers++;
@@ -55,12 +55,10 @@ async function pullWorker(workerId) {
         const added = taskQueue.enqueue([task]);
         if (added === 0) pullDupCount++;
       } else {
-        // 无任务时短暂等待避免空转
-        await sleep(200);
+        await sleep(100);
       }
     } catch (err) {
-      logger.warn(`pullWorker[${workerId}] 异常: ${err.message}`);
-      await sleep(500);
+      await sleep(300);
     }
   }
   activePullWorkers--;
@@ -68,37 +66,58 @@ async function pullWorker(workerId) {
 
 /**
  * 查询工作线程：持续从队列取任务查询，互不阻塞
+ * 重试任务带 retry_after 时间戳，未到时间的跳过
  */
 async function queryWorker(workerId) {
   activeQueryWorkers++;
   while (!workersStopped) {
-    // 检查休眠阈值
     if (!sleeping && getTotalSuccessCount() >= config.scheduler.callbackSuccessLimit) {
       enterSleepMode();
     }
 
     if (taskQueue.pendingCount === 0) {
       if (sleeping) break;
-      await sleep(50);
+      await sleep(30);
       continue;
     }
 
     const tasks = taskQueue.dequeue(1);
     if (tasks.length === 0) {
-      await sleep(50);
+      await sleep(30);
       continue;
     }
 
     const task = tasks[0];
+
+    // 检查队列中的任务是否超时（入队超过4分40秒直接丢弃）
+    if (task.enqueue_time) {
+      const age = Date.now() - task.enqueue_time;
+      if (age > config.scheduler.queueTaskTimeout) {
+        logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} good_id=${task.good_id} age=${(age / 1000).toFixed(0)}s`);
+        taskQueue.removeKey(task);
+        querySkipCount++;
+        continue;
+      }
+    }
+
+    // 重试退避：未到 retry_after 时间的放回队尾
+    if (task.retry_after && Date.now() < task.retry_after) {
+      taskQueue.requeueSilent(task);
+      await sleep(10);
+      continue;
+    }
+
     try {
       const result = await querySingle(task);
       if (result.success) {
-        addToCallbackQueue(result.task, result.data);
+        callbackQueue.push({ task: result.task, data: result.data });
       } else {
-        taskQueue.requeue([result.task]);
+        // 重试退避：根据重试次数递增等待时间（1s, 2s, 3s...最大5s）
+        const retryCount = (task.retry_count || 0);
+        task.retry_after = Date.now() + Math.min((retryCount + 1) * 1000, 5000);
+        taskQueue.requeue([task]);
       }
     } catch (err) {
-      logger.error(`queryWorker[${workerId}] 异常: ${err.message}`);
       taskQueue.requeue([task]);
     }
   }
@@ -106,23 +125,38 @@ async function queryWorker(workerId) {
 }
 
 /**
- * 回调处理循环
+ * 回调工作线程：持续从回调队列取任务发送，无需定时器驱动
  */
-async function callbackProcessLoop() {
-  if (callbackRunning) return;
+async function callbackWorker(workerId) {
+  activeCallbackWorkers++;
+  while (!workersStopped) {
+    if (callbackQueue.length === 0) {
+      if (sleeping && taskQueue.pendingCount === 0) break;
+      await sleep(20);
+      continue;
+    }
 
-  callbackRunning = true;
-  try {
-    await processCallbackQueue();
+    const item = callbackQueue.shift();
+    if (!item) continue;
+
+    try {
+      const ok = await callbackSingle(item.task, item.data);
+      if (!ok) {
+        // 失败放入重试队列（callbackService 内部管理）
+        const { addToRetryQueue } = require('../services/callbackService');
+        addToRetryQueue(item.task, item.data);
+      }
+    } catch (err) {
+      // 异常也放入重试
+      const { addToRetryQueue } = require('../services/callbackService');
+      addToRetryQueue(item.task, item.data);
+    }
 
     if (!sleeping && getTotalSuccessCount() >= config.scheduler.callbackSuccessLimit) {
       enterSleepMode();
     }
-  } catch (err) {
-    logger.error(`callbackProcessLoop 异常: ${err.message}`);
-  } finally {
-    callbackRunning = false;
   }
+  activeCallbackWorkers--;
 }
 
 /**
@@ -156,12 +190,13 @@ function statsLoop() {
   const delta = currentSuccess - statsLastSuccess;
   const rate = (delta / elapsed * 60).toFixed(1);
 
-  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount} 去重: ${pullDupCount} | 队列: ${taskQueue.pendingCount} | 回调队列: ${getCallbackQueueLength()} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers}`);
+  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount} 去重: ${pullDupCount} 超时丢弃: ${querySkipCount} | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers} cb=${activeCallbackWorkers}`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
   pullCount = 0;
   pullDupCount = 0;
+  querySkipCount = 0;
 }
 
 /**
@@ -170,13 +205,14 @@ function statsLoop() {
 function start() {
   const pullWorkerCount = config.scheduler.pullSize;
   const queryWorkerCount = config.scheduler.queryConcurrency;
+  const callbackWorkerCount = config.scheduler.callbackConcurrency;
 
   logger.info('调度器启动');
-  logger.info(`配置: pull_worker=${pullWorkerCount} query_worker=${queryWorkerCount} 回调并发=${config.scheduler.callbackConcurrency} 休眠阈值=${config.scheduler.callbackSuccessLimit}`);
+  logger.info(`配置: pull_worker=${pullWorkerCount} query_worker=${queryWorkerCount} callback_worker=${callbackWorkerCount} 休眠阈值=${config.scheduler.callbackSuccessLimit}`);
 
   workersStopped = false;
 
-  // 启动拉取工作线程池（PULL_SIZE = pull worker 数量）
+  // 启动拉取工作线程池
   logger.info(`启动 ${pullWorkerCount} 个拉取工作线程`);
   for (let i = 0; i < pullWorkerCount; i++) {
     pullWorker(i);
@@ -188,8 +224,13 @@ function start() {
     queryWorker(i);
   }
 
-  // 启动回调、清理、重试定时器
-  callbackProcessTimer = setInterval(callbackProcessLoop, config.scheduler.callbackProcessInterval);
+  // 启动回调工作线程池
+  logger.info(`启动 ${callbackWorkerCount} 个回调工作线程`);
+  for (let i = 0; i < callbackWorkerCount; i++) {
+    callbackWorker(i);
+  }
+
+  // 启动清理、重试定时器
   cleanupTimer = setInterval(cleanupLoop, config.scheduler.cleanupInterval);
   callbackRetryTimer = setInterval(callbackRetryLoop, config.scheduler.callbackRetryInterval);
 
@@ -202,11 +243,9 @@ function start() {
  */
 function stop() {
   workersStopped = true;
-  if (callbackProcessTimer) clearInterval(callbackProcessTimer);
   if (cleanupTimer) clearInterval(cleanupTimer);
   if (callbackRetryTimer) clearInterval(callbackRetryTimer);
   if (statsTimer) clearInterval(statsTimer);
-  callbackProcessTimer = null;
   cleanupTimer = null;
   callbackRetryTimer = null;
   statsTimer = null;

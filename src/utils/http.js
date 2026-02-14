@@ -1,6 +1,12 @@
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const config = require('../config');
 const logger = require('./logger');
+
+// 连接复用 Agent
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
 /**
  * 上游拉取任务 HTTP 客户端（101.34.226.247）
@@ -8,9 +14,9 @@ const logger = require('./logger');
 const pullClient = axios.create({
   baseURL: config.upstream.pullBaseUrl,
   timeout: config.httpTimeout,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+  headers: { 'Content-Type': 'application/json' },
+  httpAgent,
+  httpsAgent,
 });
 
 /**
@@ -19,9 +25,9 @@ const pullClient = axios.create({
 const uploadClient = axios.create({
   baseURL: config.upstream.uploadBaseUrl,
   timeout: config.httpTimeout,
-  headers: {
-    'Content-Type': 'application/json',
-  },
+  headers: { 'Content-Type': 'application/json' },
+  httpAgent,
+  httpsAgent,
 });
 
 /**
@@ -34,6 +40,8 @@ const tokegeClient = axios.create({
     Authorization: config.tokege.token,
     'Content-Type': 'application/json',
   },
+  httpAgent,
+  httpsAgent,
 });
 
 // 请求拦截器 - 记录请求

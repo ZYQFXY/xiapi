@@ -29,7 +29,7 @@ async function pullSingleTask() {
     // 检查任务是否超时（created_at 超过24分钟则丢弃）
     if (taskData.created_at) {
       const createdTime = new Date(taskData.created_at).getTime();
-      if (Date.now() - createdTime > config.scheduler.taskTimeout) {
+      if (Date.now() - createdTime > config.scheduler.pullTaskTimeout) {
         logger.info(`拉取任务已超时丢弃: shop_id=${taskData.shop_id} good_id=${taskData.good_id} created_at=${taskData.created_at}`);
         return null;
       }

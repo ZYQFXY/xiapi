@@ -82,6 +82,15 @@ class TaskQueue {
   }
 
   /**
+   * 静默放回队尾（不增加 retry_count，用于退避等待）
+   * @param {Object} task - 需要放回的任务
+   */
+  requeueSilent(task) {
+    task.status = 'pending';
+    this.queue.push(task);
+  }
+
+  /**
    * 清除超时任务，释放去重键
    * @param {number} timeoutMs - 超时时间（毫秒）
    * @returns {number} 清除的任务数
