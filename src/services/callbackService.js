@@ -1,4 +1,4 @@
-const { upstreamClient } = require('../utils/http');
+const { uploadClient } = require('../utils/http');
 const config = require('../config');
 const logger = require('../utils/logger');
 const taskQueue = require('../queue/taskQueue');
@@ -14,19 +14,23 @@ let totalSuccessCount = 0;
 
 /**
  * 回调单个结果
+ * POST /task/api/complete/upload
  * @param {Object} task - 任务对象
  * @param {Object} data - tokege 返回的完整数据
  * @returns {boolean} 是否成功
  */
 async function callbackSingle(task, data) {
   try {
-    await upstreamClient.post('/good/detail/user/callback/result', {
-      shop_id: task.shop_id,
-      good_id: task.good_id,
-      country: task.country,
-      trace_id: task.trace_id,
-      down_stream_vendor_name: config.upstream.vendorName,
-      content: JSON.stringify(data),
+    await uploadClient.post('/task/api/complete/upload', {
+      type: task.type,
+      task: {
+        shop_id: task.shop_id,
+        good_id: task.good_id,
+        country: task.country,
+        trace_id: task.trace_id,
+        content: JSON.stringify(data && data.response ? data.response : data),
+        phone: config.upstream.phone,
+      },
     }, {
       timeout: config.callbackTimeout,
     });

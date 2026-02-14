@@ -5,9 +5,10 @@ module.exports = {
   logLevel: process.env.LOG_LEVEL || 'info',
 
   upstream: {
-    baseUrl: process.env.UPSTREAM_BASE_URL || 'https://xp-login.szgps.cc',
-    token: process.env.UPSTREAM_TOKEN,
-    vendorName: process.env.VENDOR_NAME || 'vendor_five',
+    pullBaseUrl: process.env.UPSTREAM_PULL_URL || 'http://101.34.226.247',
+    uploadBaseUrl: process.env.UPSTREAM_UPLOAD_URL || 'http://118.25.45.42:9000',
+    phone: process.env.PHONE || '18888888888',
+    country: process.env.COUNTRY || 'tw',
   },
 
   tokege: {

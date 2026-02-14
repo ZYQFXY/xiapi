@@ -3,13 +3,23 @@ const config = require('../config');
 const logger = require('./logger');
 
 /**
- * 上游 HTTP 客户端（xp-login.szgps.cc）
+ * 上游拉取任务 HTTP 客户端（101.34.226.247）
  */
-const upstreamClient = axios.create({
-  baseURL: config.upstream.baseUrl,
+const pullClient = axios.create({
+  baseURL: config.upstream.pullBaseUrl,
   timeout: config.httpTimeout,
   headers: {
-    Authorization: config.upstream.token,
+    'Content-Type': 'application/json',
+  },
+});
+
+/**
+ * 上游上传任务 HTTP 客户端（118.25.45.42:9000）
+ */
+const uploadClient = axios.create({
+  baseURL: config.upstream.uploadBaseUrl,
+  timeout: config.httpTimeout,
+  headers: {
     'Content-Type': 'application/json',
   },
 });
@@ -27,7 +37,7 @@ const tokegeClient = axios.create({
 });
 
 // 请求拦截器 - 记录请求
-[upstreamClient, tokegeClient].forEach(client => {
+[pullClient, uploadClient, tokegeClient].forEach(client => {
   client.interceptors.request.use(req => {
     logger.debug(`HTTP ${req.method.toUpperCase()} ${req.baseURL}${req.url}`);
     return req;
@@ -47,4 +57,4 @@ const tokegeClient = axios.create({
   );
 });
 
-module.exports = { upstreamClient, tokegeClient };
+module.exports = { pullClient, uploadClient, tokegeClient };
