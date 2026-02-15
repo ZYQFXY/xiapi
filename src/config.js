@@ -19,7 +19,7 @@ module.exports = {
 
   scheduler: {
     pullInterval: parseInt(process.env.PULL_INTERVAL, 10) || 2000,
-    pullSize: parseInt(process.env.PULL_SIZE, 10) || 50,
+    pullSize: parseInt(process.env.PULL_SIZE, 10) || 250,
     batchSize: parseInt(process.env.BATCH_SIZE, 10) || 200,
     batchCheckInterval: parseInt(process.env.BATCH_CHECK_INTERVAL, 10) || 2000,
     taskTimeout: parseInt(process.env.TASK_TIMEOUT, 10) || 1440000,

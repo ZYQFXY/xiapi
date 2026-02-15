@@ -13,12 +13,16 @@ const {
 let cleanupTimer = null;
 let callbackRetryTimer = null;
 let statsTimer = null;
-let sleeping = false;
 let workersStopped = true;
 let pullingPaused = false;
+let autoPaused = false; // 队列背压自动暂停拉取
 let activePullWorkers = 0;
 let activeQueryWorkers = 0;
 let activeCallbackWorkers = 0;
+
+// 队列背压阈值
+const QUEUE_HIGH_WATER = 20000;
+const QUEUE_LOW_WATER = 2000;
 
 // 回调队列（scheduler 内部管理）
 const callbackQueue = [];
@@ -42,12 +46,22 @@ function sleep(ms) {
 }
 
 /**
- * 进入休眠模式：停止拉取新任务
+ * 检查队列背压，自动控制拉取
  */
-function enterSleepMode() {
-  if (sleeping) return;
-  sleeping = true;
-  logger.info(`=== 进入休眠模式 === 回调成功已达 ${config.scheduler.callbackSuccessLimit} 条，停止拉取新任务，处理剩余队列`);
+function checkBackpressure() {
+  const pending = taskQueue.pendingCount;
+  if (!autoPaused && pending > QUEUE_HIGH_WATER) {
+    autoPaused = true;
+    logger.info(`=== 队列背压 === 堆积任务 ${pending} 超过 ${QUEUE_HIGH_WATER}，自动停止拉取`);
+  } else if (autoPaused && pending < QUEUE_LOW_WATER) {
+    autoPaused = false;
+    logger.info(`=== 队列恢复 === 堆积任务 ${pending} 低于 ${QUEUE_LOW_WATER}，自动恢复拉取`);
+    // 补足已退出的拉取线程
+    const pullNeeded = config.scheduler.pullSize - activePullWorkers;
+    for (let i = 0; i < pullNeeded; i++) {
+      pullWorker(i);
+    }
+  }
 }
 
 /**
@@ -55,7 +69,7 @@ function enterSleepMode() {
  */
 async function pullWorker(workerId) {
   activePullWorkers++;
-  while (!workersStopped && !sleeping && !pullingPaused) {
+  while (!workersStopped && !pullingPaused && !autoPaused) {
     try {
       const task = await pullSingleTask();
       if (task) {
@@ -79,12 +93,9 @@ async function pullWorker(workerId) {
 async function queryWorker(workerId) {
   activeQueryWorkers++;
   while (!workersStopped) {
-    if (!sleeping && getTotalSuccessCount() >= config.scheduler.callbackSuccessLimit) {
-      enterSleepMode();
-    }
+    checkBackpressure();
 
     if (taskQueue.pendingCount === 0) {
-      if (sleeping) break;
       await sleep(5);
       continue;
     }
@@ -151,7 +162,6 @@ async function callbackWorker(workerId) {
   activeCallbackWorkers++;
   while (!workersStopped) {
     if (callbackQueue.length === 0) {
-      if (sleeping && taskQueue.pendingCount === 0) break;
       await sleep(5);
       continue;
     }
@@ -194,10 +204,6 @@ async function callbackWorker(workerId) {
     });
 
     await Promise.all(promises);
-
-    if (!sleeping && getTotalSuccessCount() >= config.scheduler.callbackSuccessLimit) {
-      enterSleepMode();
-    }
   }
   activeCallbackWorkers--;
 }
@@ -258,11 +264,11 @@ function start() {
   const callbackWorkerCount = config.scheduler.callbackConcurrency;
 
   workersStopped = false;
-  sleeping = false;
+  autoPaused = false;
   pullingPaused = false;
 
   logger.info('调度器启动');
-  logger.info(`配置: pull_worker=${pullWorkerCount} query_worker=${queryWorkerCount} callback_worker=${callbackWorkerCount} 休眠阈值=${config.scheduler.callbackSuccessLimit}`);
+  logger.info(`配置: pull_worker=${pullWorkerCount} query_worker=${queryWorkerCount} callback_worker=${callbackWorkerCount} 背压阈值=${QUEUE_HIGH_WATER}/${QUEUE_LOW_WATER}`);
 
   // 启动拉取工作线程池（补足差额）
   const pullNeeded = pullWorkerCount - activePullWorkers;
@@ -308,7 +314,7 @@ function stop() {
   cleanupTimer = null;
   callbackRetryTimer = null;
   statsTimer = null;
-  sleeping = false;
+  autoPaused = false;
   pullingPaused = false;
   logger.info('调度器已停止');
 }
@@ -320,7 +326,7 @@ function startPulling() {
   if (workersStopped) return;
 
   pullingPaused = false;
-  sleeping = false;
+  autoPaused = false;
 
   // 补足已退出的工作线程
   const pullNeeded = config.scheduler.pullSize - activePullWorkers;
@@ -360,7 +366,7 @@ function stopPulling() {
  */
 function getStats() {
   return {
-    sleeping,
+    autoPaused,
     workersStopped,
     pullingPaused,
     activePullWorkers,

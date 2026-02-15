@@ -212,9 +212,9 @@ function updateStats(data) {
 
   // 调度器状态
   var statusEl = $('scheduler-status');
-  if (data.schedulerStats && data.schedulerStats.sleeping) {
+  if (data.schedulerStats && data.schedulerStats.autoPaused) {
     statusEl.className = 'scheduler-status sleeping';
-    statusEl.textContent = '休眠中';
+    statusEl.textContent = '背压暂停';
   } else if (data.schedulerRunning) {
     statusEl.className = 'scheduler-status running';
     statusEl.textContent = '运行中';
@@ -226,8 +226,8 @@ function updateStats(data) {
   // 按钮状态
   $('btn-start').disabled = data.schedulerRunning;
   $('btn-stop').disabled = !data.schedulerRunning;
-  $('btn-pull-start').disabled = !data.schedulerRunning || (data.schedulerStats && !data.schedulerStats.pullingPaused && !data.schedulerStats.sleeping);
-  $('btn-pull-stop').disabled = !data.schedulerRunning || (data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.sleeping));
+  $('btn-pull-start').disabled = !data.schedulerRunning || (data.schedulerStats && !data.schedulerStats.pullingPaused && !data.schedulerStats.autoPaused);
+  $('btn-pull-stop').disabled = !data.schedulerRunning || (data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.autoPaused));
 }
 
 function classifyLog(text) {
