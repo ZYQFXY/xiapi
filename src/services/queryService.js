@@ -8,6 +8,11 @@ const RETRY_ERROR_CODES = [
   1100002  // Product is being processed
 ];
 
+// 额度耗尽错误码 → 不重试，不回调，不算下架
+const CREDIT_EXHAUSTED_CODES = [
+  1070102,  // Insufficient credit
+];
+
 // 数据请求统计
 const queryStats = {
   totalRequests: 0,     // 总请求数（包括重试）
@@ -15,6 +20,7 @@ const queryStats = {
   failureCount: 0,      // 查询失败（需要重试的请求：1000000、1100002、网络异常）
   offlineCount: 0,      // 商品下架（_success=false 无 item、其他错误码等）
   processingCount: 0,   // 商品处理中的次数（1100002，包含在 failureCount 中）
+  creditExhaustedCount: 0, // 额度耗尽次数
 };
 
 // 每分钟查询次数统计（用于计算速率）
@@ -89,6 +95,13 @@ async function querySingle(task) {
           logger.warn(`查询失败(需重试): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
         }
         return { task, success: false, data: null };
+      }
+
+      // 检查是否为额度耗尽
+      if (CREDIT_EXHAUSTED_CODES.includes(errCode)) {
+        queryStats.creditExhaustedCount++;
+        logger.warn(`查询失败(额度耗尽): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
+        return { task, success: false, data: null, creditExhausted: true };
       }
 
       // 其他错误码 → 不重试，当作商品下架，直接回调

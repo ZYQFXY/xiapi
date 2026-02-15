@@ -52,6 +52,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .scheduler-status.running { background: rgba(76,175,80,0.2); color: #4caf50; }
 .scheduler-status.stopped { background: rgba(244,67,54,0.2); color: #f44336; }
 .scheduler-status.sleeping { background: rgba(255,152,0,0.2); color: #ff9800; }
+.scheduler-status.credit-exhausted { background: rgba(156,39,176,0.2); color: #ce93d8; }
 
 /* 任务日志三面板 */
 .task-logs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 0 24px 24px; }
@@ -112,6 +113,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     <div class="stat-row"><span class="stat-label">查询失败(重试)</span><span class="stat-value" id="s-query-failure">0</span></div>
     <div class="stat-row"><span class="stat-label">商品下架</span><span class="stat-value" id="s-offline">0</span></div>
     <div class="stat-row"><span class="stat-label">商品处理中</span><span class="stat-value" id="s-processing">0</span></div>
+    <div class="stat-row"><span class="stat-label">额度耗尽</span><span class="stat-value" id="s-credit-exhausted">0</span></div>
   </div>
   <div class="panel">
     <h3>客户接口统计 <span class="rate-value" id="s-callback-rate">0</span> 条/分</h3>
@@ -221,6 +223,7 @@ function updateStats(data) {
     $('s-query-failure').textContent = data.queryStats.failureCount || 0;
     $('s-offline').textContent = data.queryStats.offlineCount || 0;
     $('s-processing').textContent = data.queryStats.processingCount || 0;
+    $('s-credit-exhausted').textContent = data.queryStats.creditExhaustedCount || 0;
     $('s-query-rate').textContent = data.queryStats.queryRatePerMin || 0;
   }
 
@@ -249,7 +252,10 @@ function updateStats(data) {
   }
 
   var statusEl = $('scheduler-status');
-  if (data.schedulerStats && data.schedulerStats.autoPaused) {
+  if (data.schedulerStats && data.schedulerStats.creditExhausted) {
+    statusEl.className = 'scheduler-status credit-exhausted';
+    statusEl.textContent = '额度耗尽';
+  } else if (data.schedulerStats && data.schedulerStats.autoPaused) {
     statusEl.className = 'scheduler-status sleeping';
     statusEl.textContent = '背压暂停';
   } else if (data.schedulerRunning) {

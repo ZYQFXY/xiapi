@@ -16,6 +16,7 @@ let statsTimer = null;
 let workersStopped = true;
 let pullingPaused = false;
 let autoPaused = false; // 队列背压自动暂停拉取
+let creditExhausted = false; // API额度耗尽自动暂停
 let activePullWorkers = 0;
 let activeQueryWorkers = 0;
 let activeCallbackWorkers = 0;
@@ -31,6 +32,7 @@ const DEGRADE_TIMEOUT_RATE = 0.5;     // 超时率 ≥ 50% 触发降级
 const RECOVER_TIMEOUT_RATE = 0.1;     // 超时率 < 10% 恢复正常
 const CIRCUIT_BREAK_THRESHOLD = 30;   // 连续超时 ≥ 30 次触发熔断暂停
 const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断暂停 10 秒
+const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
 
 // 查询服务健康状态
 const queryHealth = {
@@ -93,6 +95,7 @@ let pullCount = 0;
 let pullDupCount = 0;
 let querySkipCount = 0;
 let queueTimeoutCount = 0;  // 队列中超时统计
+let creditExhaustedCount = 0;  // 额度耗尽触发次数
 
 // 上次统计输出时的快照（用于计算增量）
 let lastStatsPullCount = 0;
@@ -156,11 +159,64 @@ function checkBackpressure() {
 }
 
 /**
+ * 额度探测：定期尝试一个查询以检测 API 额度是否恢复
+ */
+async function creditProbe() {
+  await sleep(CREDIT_PROBE_INTERVAL);
+  if (workersStopped || !creditExhausted) return;
+
+  // 尝试拉取一个任务来探测
+  let task = null;
+  if (taskQueue.pendingCount > 0) {
+    const tasks = taskQueue.dequeue(1);
+    if (tasks.length > 0) task = tasks[0];
+  }
+  if (!task) {
+    try {
+      task = await pullSingleTask();
+    } catch (e) {
+      logger.info('[额度探测] 拉取探测任务失败，等待下次探测...');
+      return;
+    }
+  }
+  if (!task) {
+    logger.info('[额度探测] 无可用任务，等待下次探测...');
+    return;
+  }
+
+  try {
+    const result = await querySingle(task);
+    if (result.creditExhausted) {
+      taskQueue.removeKey(task);
+      logger.info('[额度探测] API 额度仍未恢复，继续等待...');
+    } else {
+      creditExhausted = false;
+      logger.info('[额度恢复] tokege API 额度已恢复，自动恢复拉取和查询');
+      if (result.success) {
+        logTask('query', true, task.shop_id, task.item_id);
+        callbackQueue.push({ task: result.task, data: result.data });
+      } else {
+        logTask('query', false, task.shop_id, task.item_id);
+        taskQueue.requeue([task]);
+      }
+      // 恢复拉取工作线程
+      const pullNeeded = config.scheduler.pullSize - activePullWorkers;
+      for (let i = 0; i < pullNeeded; i++) {
+        pullWorker(i);
+      }
+    }
+  } catch (err) {
+    taskQueue.removeKey(task);
+    logger.warn(`[额度探测] 探测异常: ${err.message}`);
+  }
+}
+
+/**
  * 拉取工作线程：串行拉取，避免并发竞争同一个任务
  */
 async function pullWorker(workerId) {
   activePullWorkers++;
-  while (!workersStopped && !pullingPaused && !autoPaused) {
+  while (!workersStopped && !pullingPaused && !autoPaused && !creditExhausted) {
     try {
       const task = await pullSingleTask();
       if (task) {
@@ -189,6 +245,16 @@ async function queryWorker(workerId) {
   activeQueryWorkers++;
   while (!workersStopped) {
     checkBackpressure();
+
+    // 额度耗尽：worker 0 做探测，其他休眠
+    if (creditExhausted) {
+      if (workerId === 0) {
+        await creditProbe();
+      } else {
+        await sleep(CREDIT_PROBE_INTERVAL);
+      }
+      continue;
+    }
 
     // 熔断：连续超时过多，暂停一段时间
     if (queryHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
@@ -253,6 +319,9 @@ async function queryProcessBatch() {
     try {
       const result = await querySingle(task);
       recordSample(queryHealth, false, '查询');
+      if (result.creditExhausted) {
+        return { type: 'creditExhausted', task };
+      }
       if (result.success) {
         logTask('query', true, task.shop_id, task.item_id);
         return { type: 'callback', task: result.task, data: result.data };
@@ -276,6 +345,13 @@ async function queryProcessBatch() {
     if (!result) continue;
     if (result.type === 'callback') {
       callbackQueue.push({ task: result.task, data: result.data });
+    } else if (result.type === 'creditExhausted') {
+      taskQueue.removeKey(result.task);
+      if (!creditExhausted) {
+        creditExhausted = true;
+        creditExhaustedCount++;
+        logger.warn('[额度耗尽] tokege API 额度不足，自动停止拉取和查询，结果已丢弃，每 30 秒探测一次...');
+      }
     } else if (result.type === 'retry') {
       taskQueue.requeue([result.task]);
     }
@@ -302,6 +378,15 @@ async function queryProcessOne() {
   try {
     const result = await querySingle(task);
     recordSample(queryHealth, false, '查询');
+    if (result.creditExhausted) {
+      taskQueue.removeKey(task);
+      if (!creditExhausted) {
+        creditExhausted = true;
+        creditExhaustedCount++;
+        logger.warn('[额度耗尽] tokege API 额度不足，自动停止拉取和查询，结果已丢弃，每 30 秒探测一次...');
+      }
+      return;
+    }
     if (result.success) {
       logTask('query', true, task.shop_id, task.item_id);
       callbackQueue.push({ task: result.task, data: result.data });
@@ -461,7 +546,7 @@ function statsLoop() {
   const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
   const deltaTimeout = queueTimeoutCount - lastStatsQueueTimeoutCount;
 
-  const queryMode = queryHealth.degraded ? '降级' : '正常';
+  const queryMode = creditExhausted ? '额度耗尽' : queryHealth.degraded ? '降级' : '正常';
   const cbMode = callbackHealth.degraded ? '降级' : '正常';
 
   logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
@@ -485,6 +570,7 @@ function start() {
   workersStopped = false;
   autoPaused = false;
   pullingPaused = false;
+  creditExhausted = false;
 
   logger.info('调度器启动');
   logger.info(`配置: pull_worker=${pullWorkerCount} query_worker=${queryWorkerCount} callback_worker=${callbackWorkerCount} 背压阈值=${QUEUE_HIGH_WATER}/${QUEUE_LOW_WATER}`);
@@ -546,6 +632,7 @@ function startPulling() {
 
   pullingPaused = false;
   autoPaused = false;
+  creditExhausted = false;
 
   // 补足已退出的工作线程
   const pullNeeded = config.scheduler.pullSize - activePullWorkers;
@@ -588,6 +675,7 @@ function getStats() {
     autoPaused,
     workersStopped,
     pullingPaused,
+    creditExhausted,
     activePullWorkers,
     activeQueryWorkers,
     activeCallbackWorkers,
@@ -598,6 +686,7 @@ function getStats() {
     pullDupCount,
     querySkipCount,
     queueTimeoutCount,
+    creditExhaustedCount,
   };
 }
 
