@@ -85,50 +85,60 @@ async function queryWorker(workerId) {
 
     if (taskQueue.pendingCount === 0) {
       if (sleeping) break;
-      await sleep(10);
+      await sleep(5);
       continue;
     }
 
-    const tasks = taskQueue.dequeue(1);
+    const tasks = taskQueue.dequeue(5);
     if (tasks.length === 0) {
-      await sleep(10);
+      await sleep(5);
       continue;
     }
 
-    const task = tasks[0];
-
-    // 检查队列中的任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
-    if (task.created_at) {
-      const createdTime = new Date(task.created_at).getTime();
-      const age = Date.now() - createdTime;
-      if (age > 290000) {  // 4分50秒 = 290000ms
-        logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} age=${(age / 1000).toFixed(0)}s`);
-        taskQueue.removeKey(task);
-        querySkipCount++;
-        queueTimeoutCount++;  // 队列中超时计数
-        continue;
+    // 批量并发处理多个任务
+    const promises = tasks.map(async (task) => {
+      // 检查队列中的任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
+      if (task.created_at) {
+        const createdTime = new Date(task.created_at).getTime();
+        const age = Date.now() - createdTime;
+        if (age > 290000) {  // 4分50秒 = 290000ms
+          logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} age=${(age / 1000).toFixed(0)}s`);
+          taskQueue.removeKey(task);
+          querySkipCount++;
+          return null;
+        }
       }
-    }
 
-    // 重试退避：未到 retry_after 时间的放回队尾
-    if (task.retry_after && Date.now() < task.retry_after) {
-      taskQueue.requeueSilent(task);
-      await sleep(10);
-      continue;
-    }
+      // 重试退避：未到 retry_after 时间的放回队尾
+      if (task.retry_after && Date.now() < task.retry_after) {
+        taskQueue.requeueSilent(task);
+        return null;
+      }
 
-    try {
-      const result = await querySingle(task);
-      if (result.success) {
+      try {
+        const result = await querySingle(task);
+        if (result.success) {
+          return { type: 'callback', task: result.task, data: result.data };
+        } else {
+          // 重试退避：根据重试次数递增等待时间（500ms, 1s, 1.5s...最大3s）
+          const retryCount = (task.retry_count || 0);
+          task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
+          return { type: 'retry', task };
+        }
+      } catch (err) {
+        return { type: 'retry', task };
+      }
+    });
+
+    const results = await Promise.all(promises);
+
+    for (const result of results) {
+      if (!result) continue;
+      if (result.type === 'callback') {
         callbackQueue.push({ task: result.task, data: result.data });
-      } else {
-        // 重试退避：根据重试次数递增等待时间（500ms, 1s, 1.5s...最大3s）
-        const retryCount = (task.retry_count || 0);
-        task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
-        taskQueue.requeue([task]);
+      } else if (result.type === 'retry') {
+        taskQueue.requeue([result.task]);
       }
-    } catch (err) {
-      taskQueue.requeue([task]);
     }
   }
   activeQueryWorkers--;
@@ -142,37 +152,48 @@ async function callbackWorker(workerId) {
   while (!workersStopped) {
     if (callbackQueue.length === 0) {
       if (sleeping && taskQueue.pendingCount === 0) break;
-      await sleep(10);
+      await sleep(5);
       continue;
     }
 
-    const item = callbackQueue.shift();
-    if (!item) continue;
-
-    // 检查任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
-    if (item.task.created_at) {
-      const createdTime = new Date(item.task.created_at).getTime();
-      const age = Date.now() - createdTime;
-      if (age > 290000) {  // 4分50秒 = 290000ms
-        logger.info(`回调任务已超时丢弃: shop_id=${item.task.shop_id} item_id=${item.task.item_id} created_at=${item.task.created_at} age=${(age / 1000).toFixed(0)}s`);
-        taskQueue.removeKey(item.task);
-        queueTimeoutCount++;  // 队列中超时计数
-        continue;
-      }
+    // 批量取出多个任务并发处理
+    const batchSize = Math.min(8, callbackQueue.length);
+    const items = [];
+    for (let i = 0; i < batchSize; i++) {
+      const item = callbackQueue.shift();
+      if (item) items.push(item);
     }
 
-    try {
-      const ok = await callbackSingle(item.task, item.data);
-      if (!ok) {
-        // 失败放入重试队列（callbackService 内部管理）
+    if (items.length === 0) continue;
+
+    // 并发处理所有回调
+    const promises = items.map(async (item) => {
+      // 检查任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
+      if (item.task.created_at) {
+        const createdTime = new Date(item.task.created_at).getTime();
+        const age = Date.now() - createdTime;
+        if (age > 290000) {  // 4分50秒 = 290000ms
+          logger.info(`回调任务已超时丢弃: shop_id=${item.task.shop_id} item_id=${item.task.item_id} created_at=${item.task.created_at} age=${(age / 1000).toFixed(0)}s`);
+          taskQueue.removeKey(item.task);
+          return null;
+        }
+      }
+
+      try {
+        const ok = await callbackSingle(item.task, item.data);
+        if (!ok) {
+          // 失败放入重试队列（callbackService 内部管理）
+          const { addToRetryQueue } = require('../services/callbackService');
+          addToRetryQueue(item.task, item.data);
+        }
+      } catch (err) {
+        // 异常也放入重试
         const { addToRetryQueue } = require('../services/callbackService');
         addToRetryQueue(item.task, item.data);
       }
-    } catch (err) {
-      // 异常也放入重试
-      const { addToRetryQueue } = require('../services/callbackService');
-      addToRetryQueue(item.task, item.data);
-    }
+    });
+
+    await Promise.all(promises);
 
     if (!sleeping && getTotalSuccessCount() >= config.scheduler.callbackSuccessLimit) {
       enterSleepMode();

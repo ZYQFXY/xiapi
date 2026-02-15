@@ -21,13 +21,12 @@ class TaskQueue {
   }
 
   /**
-   * 批量入队，自动去重，设置 enqueue_time
+   * 批量入队，自动去重
    * @param {Array} tasks - 任务数组
    * @returns {number} 实际入队数量
    */
   enqueue(tasks) {
     let added = 0;
-    const now = Date.now();
 
     for (const task of tasks) {
       const key = this._makeKey(task);
@@ -38,7 +37,6 @@ class TaskQueue {
       this.dedupeSet.add(key);
       this.queue.push({
         ...task,
-        enqueue_time: now,
         retry_count: 0,
         status: 'pending',
       });
@@ -96,28 +94,8 @@ class TaskQueue {
    * @returns {number} 清除的任务数
    */
   purgeExpired(timeoutMs) {
-    const now = Date.now();
-    const before = this.queue.length;
-
-    this.queue = this.queue.filter(task => {
-      // 统一使用任务创建时间 created_at 判断是否超时
-      if (!task.created_at) {
-        return true;  // 没有 created_at 的任务保留
-      }
-
-      const createdTime = new Date(task.created_at).getTime();
-      const expired = (now - createdTime) > timeoutMs;
-
-      if (expired) {
-        this.dedupeSet.delete(this._makeKey(task));
-        logger.info(`任务超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} retry=${task.retry_count}`);
-      }
-      return !expired;
-    });
-
-    const purged = before - this.queue.length;
-    this.stats.totalExpired += purged;
-    return purged;
+    // 不再使用基于时间的超时清理，由查询和回调阶段的实时检查处理
+    return 0;
   }
 
   /**
