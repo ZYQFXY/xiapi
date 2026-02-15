@@ -24,6 +24,65 @@ let activeCallbackWorkers = 0;
 const QUEUE_HIGH_WATER = 20000;
 const QUEUE_LOW_WATER = 2000;
 
+// ======== 外部 API 健康检测 & 自动降级 ========
+// 滑动窗口统计：最近 WINDOW_SIZE 秒内的成功/超时次数
+const HEALTH_WINDOW_MS = 15000;       // 15 秒统计窗口
+const DEGRADE_TIMEOUT_RATE = 0.5;     // 超时率 ≥ 50% 触发降级
+const RECOVER_TIMEOUT_RATE = 0.1;     // 超时率 < 10% 恢复正常
+const CIRCUIT_BREAK_THRESHOLD = 30;   // 连续超时 ≥ 30 次触发熔断暂停
+const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断暂停 10 秒
+
+// 查询服务健康状态
+const queryHealth = {
+  samples: [],          // { ts, timeout: bool }
+  consecutiveTimeouts: 0,
+  degraded: false,      // true = 降级模式（串行），false = 正常模式（批量并发）
+};
+
+// 回调服务健康状态
+const callbackHealth = {
+  samples: [],
+  consecutiveTimeouts: 0,
+  degraded: false,
+};
+
+/**
+ * 记录一次请求结果并更新健康状态
+ */
+function recordSample(health, isTimeout, label) {
+  const now = Date.now();
+  health.samples.push({ ts: now, timeout: isTimeout });
+
+  // 清理过期样本
+  const cutoff = now - HEALTH_WINDOW_MS;
+  while (health.samples.length > 0 && health.samples[0].ts < cutoff) {
+    health.samples.shift();
+  }
+
+  // 更新连续超时计数
+  if (isTimeout) {
+    health.consecutiveTimeouts++;
+  } else {
+    health.consecutiveTimeouts = 0;
+  }
+
+  // 计算窗口内超时率
+  const total = health.samples.length;
+  if (total < 5) return; // 样本太少不做判断
+
+  const timeoutCount = health.samples.filter(s => s.timeout).length;
+  const timeoutRate = timeoutCount / total;
+
+  // 状态切换
+  if (!health.degraded && timeoutRate >= DEGRADE_TIMEOUT_RATE) {
+    health.degraded = true;
+    logger.warn(`[降级] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，切换为串行模式`);
+  } else if (health.degraded && timeoutRate < RECOVER_TIMEOUT_RATE) {
+    health.degraded = false;
+    logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，恢复批量并发模式`);
+  }
+}
+
 // 回调队列（scheduler 内部管理）
 const callbackQueue = [];
 
@@ -40,6 +99,38 @@ let lastStatsPullCount = 0;
 let lastStatsPullDupCount = 0;
 let lastStatsQuerySkipCount = 0;
 let lastStatsQueueTimeoutCount = 0;
+
+// ======== 任务级结构化日志（供 Web 面板三窗口展示）========
+const TASK_LOG_HISTORY = 100;
+const TASK_LOG_PER_BROADCAST = 50;
+const taskLogHistory = { pull: [], query: [], callback: [] };
+const taskLogPending = { pull: [], query: [], callback: [] };
+
+function logTask(channel, ok, shopId, itemId) {
+  const entry = { ts: Date.now(), ok, sid: String(shopId || ''), iid: String(itemId || '') };
+  taskLogPending[channel].push(entry);
+  taskLogHistory[channel].push(entry);
+  if (taskLogHistory[channel].length > TASK_LOG_HISTORY) {
+    taskLogHistory[channel].shift();
+  }
+}
+
+function drainTaskLogs() {
+  const result = {};
+  for (const ch of ['pull', 'query', 'callback']) {
+    const arr = taskLogPending[ch].splice(0);
+    result[ch] = arr.length > TASK_LOG_PER_BROADCAST ? arr.slice(-TASK_LOG_PER_BROADCAST) : arr;
+  }
+  return result;
+}
+
+function getTaskLogHistory() {
+  return {
+    pull: taskLogHistory.pull.slice(-TASK_LOG_PER_BROADCAST),
+    query: taskLogHistory.query.slice(-TASK_LOG_PER_BROADCAST),
+    callback: taskLogHistory.callback.slice(-TASK_LOG_PER_BROADCAST),
+  };
+}
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -76,10 +167,12 @@ async function pullWorker(workerId) {
         pullCount++;
         const added = taskQueue.enqueue([task]);
         if (added === 0) pullDupCount++;
+        logTask('pull', true, task.shop_id, task.item_id);
       } else {
         await sleep(100);
       }
     } catch (err) {
+      logTask('pull', false, '', '');
       await sleep(300);
     }
   }
@@ -87,125 +180,248 @@ async function pullWorker(workerId) {
 }
 
 /**
- * 查询工作线程：持续从队列取任务查询，互不阻塞
- * 重试任务带 retry_after 时间戳，未到时间的跳过
+ * 查询工作线程：
+ *   正常模式 → 批量取 5 个任务 Promise.all 并发处理（高吞吐）
+ *   降级模式 → 串行逐个处理（保护 event loop）
+ *   熔断    → 连续超时过多时暂停等待网络恢复
  */
 async function queryWorker(workerId) {
   activeQueryWorkers++;
   while (!workersStopped) {
     checkBackpressure();
 
+    // 熔断：连续超时过多，暂停一段时间
+    if (queryHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
+      if (workerId === 0) {
+        logger.warn(`[熔断] 查询连续超时 ${queryHealth.consecutiveTimeouts} 次，暂停 ${CIRCUIT_BREAK_PAUSE_MS / 1000} 秒`);
+      }
+      await sleep(CIRCUIT_BREAK_PAUSE_MS);
+      queryHealth.consecutiveTimeouts = 0;
+      // 熔断恢复后强制进入降级模式，避免批量并发再次打死 event loop
+      if (!queryHealth.degraded) {
+        queryHealth.degraded = true;
+        logger.warn(`[熔断→降级] 查询熔断恢复，强制进入串行模式`);
+      }
+      continue;
+    }
+
     if (taskQueue.pendingCount === 0) {
-      await sleep(5);
+      await sleep(queryHealth.degraded ? 50 : 5);
       continue;
     }
 
-    const tasks = taskQueue.dequeue(5);
-    if (tasks.length === 0) {
-      await sleep(5);
-      continue;
-    }
-
-    // 批量并发处理多个任务
-    const promises = tasks.map(async (task) => {
-      // 检查队列中的任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
-      if (task.created_at) {
-        const createdTime = new Date(task.created_at).getTime();
-        const age = Date.now() - createdTime;
-        if (age > 290000) {  // 4分50秒 = 290000ms
-          logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} age=${(age / 1000).toFixed(0)}s`);
-          taskQueue.removeKey(task);
-          querySkipCount++;
-          return null;
-        }
-      }
-
-      // 重试退避：未到 retry_after 时间的放回队尾
-      if (task.retry_after && Date.now() < task.retry_after) {
-        taskQueue.requeueSilent(task);
-        return null;
-      }
-
-      try {
-        const result = await querySingle(task);
-        if (result.success) {
-          return { type: 'callback', task: result.task, data: result.data };
-        } else {
-          // 重试退避：根据重试次数递增等待时间（500ms, 1s, 1.5s...最大3s）
-          const retryCount = (task.retry_count || 0);
-          task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
-          return { type: 'retry', task };
-        }
-      } catch (err) {
-        return { type: 'retry', task };
-      }
-    });
-
-    const results = await Promise.all(promises);
-
-    for (const result of results) {
-      if (!result) continue;
-      if (result.type === 'callback') {
-        callbackQueue.push({ task: result.task, data: result.data });
-      } else if (result.type === 'retry') {
-        taskQueue.requeue([result.task]);
-      }
+    if (queryHealth.degraded) {
+      // ===== 降级模式：串行处理单个任务 =====
+      await queryProcessOne();
+    } else {
+      // ===== 正常模式：批量并发处理 =====
+      await queryProcessBatch();
     }
   }
   activeQueryWorkers--;
 }
 
+/** 检查任务是否队列中超时，超时返回 true */
+function isTaskExpired(task) {
+  if (!task.created_at) return false;
+  const age = Date.now() - new Date(task.created_at).getTime();
+  if (age > 290000) {
+    logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} age=${(age / 1000).toFixed(0)}s`);
+    taskQueue.removeKey(task);
+    querySkipCount++;
+    return true;
+  }
+  return false;
+}
+
+/** 正常模式：批量取任务并发处理 */
+async function queryProcessBatch() {
+  const tasks = taskQueue.dequeue(5);
+  if (tasks.length === 0) {
+    await sleep(5);
+    return;
+  }
+
+  const promises = tasks.map(async (task) => {
+    if (isTaskExpired(task)) return null;
+
+    if (task.retry_after && Date.now() < task.retry_after) {
+      taskQueue.requeueSilent(task);
+      return null;
+    }
+
+    try {
+      const result = await querySingle(task);
+      recordSample(queryHealth, false, '查询');
+      if (result.success) {
+        logTask('query', true, task.shop_id, task.item_id);
+        return { type: 'callback', task: result.task, data: result.data };
+      } else {
+        logTask('query', false, task.shop_id, task.item_id);
+        const retryCount = (task.retry_count || 0);
+        task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
+        return { type: 'retry', task };
+      }
+    } catch (err) {
+      logTask('query', false, task.shop_id, task.item_id);
+      const isTimeout = !!(err.message && err.message.includes('timeout'));
+      recordSample(queryHealth, isTimeout, '查询');
+      return { type: 'retry', task };
+    }
+  });
+
+  const results = await Promise.all(promises);
+
+  for (const result of results) {
+    if (!result) continue;
+    if (result.type === 'callback') {
+      callbackQueue.push({ task: result.task, data: result.data });
+    } else if (result.type === 'retry') {
+      taskQueue.requeue([result.task]);
+    }
+  }
+}
+
+/** 降级模式：串行处理单个任务 */
+async function queryProcessOne() {
+  const tasks = taskQueue.dequeue(1);
+  if (tasks.length === 0) {
+    await sleep(50);
+    return;
+  }
+
+  const task = tasks[0];
+  if (isTaskExpired(task)) return;
+
+  if (task.retry_after && Date.now() < task.retry_after) {
+    taskQueue.requeueSilent(task);
+    await sleep(10);
+    return;
+  }
+
+  try {
+    const result = await querySingle(task);
+    recordSample(queryHealth, false, '查询');
+    if (result.success) {
+      logTask('query', true, task.shop_id, task.item_id);
+      callbackQueue.push({ task: result.task, data: result.data });
+    } else {
+      logTask('query', false, task.shop_id, task.item_id);
+      const retryCount = (task.retry_count || 0);
+      task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
+      taskQueue.requeue([task]);
+    }
+  } catch (err) {
+    logTask('query', false, task.shop_id, task.item_id);
+    const isTimeout = !!(err.message && err.message.includes('timeout'));
+    recordSample(queryHealth, isTimeout, '查询');
+    taskQueue.requeue([task]);
+  }
+}
+
 /**
- * 回调工作线程：持续从回调队列取任务发送，无需定时器驱动
+ * 回调工作线程：
+ *   正常模式 → 批量取 8 个任务 Promise.all 并发处理
+ *   降级模式 → 串行逐个处理
+ *   熔断    → 连续超时过多时暂停
  */
 async function callbackWorker(workerId) {
   activeCallbackWorkers++;
   while (!workersStopped) {
-    if (callbackQueue.length === 0) {
-      await sleep(5);
+    // 熔断
+    if (callbackHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
+      if (workerId === 0) {
+        logger.warn(`[熔断] 回调连续超时 ${callbackHealth.consecutiveTimeouts} 次，暂停 ${CIRCUIT_BREAK_PAUSE_MS / 1000} 秒`);
+      }
+      await sleep(CIRCUIT_BREAK_PAUSE_MS);
+      callbackHealth.consecutiveTimeouts = 0;
+      // 熔断恢复后强制进入降级模式
+      if (!callbackHealth.degraded) {
+        callbackHealth.degraded = true;
+        logger.warn(`[熔断→降级] 回调熔断恢复，强制进入串行模式`);
+      }
       continue;
     }
 
-    // 批量取出多个任务并发处理
-    const batchSize = Math.min(8, callbackQueue.length);
-    const items = [];
-    for (let i = 0; i < batchSize; i++) {
-      const item = callbackQueue.shift();
-      if (item) items.push(item);
+    if (callbackQueue.length === 0) {
+      await sleep(callbackHealth.degraded ? 50 : 5);
+      continue;
     }
 
-    if (items.length === 0) continue;
-
-    // 并发处理所有回调
-    const promises = items.map(async (item) => {
-      // 检查任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
-      if (item.task.created_at) {
-        const createdTime = new Date(item.task.created_at).getTime();
-        const age = Date.now() - createdTime;
-        if (age > 290000) {  // 4分50秒 = 290000ms
-          logger.info(`回调任务已超时丢弃: shop_id=${item.task.shop_id} item_id=${item.task.item_id} created_at=${item.task.created_at} age=${(age / 1000).toFixed(0)}s`);
-          taskQueue.removeKey(item.task);
-          return null;
-        }
-      }
-
-      try {
-        const ok = await callbackSingle(item.task, item.data);
-        if (!ok) {
-          // 失败放入重试队列（callbackService 内部管理）
-          const { addToRetryQueue } = require('../services/callbackService');
-          addToRetryQueue(item.task, item.data);
-        }
-      } catch (err) {
-        // 异常也放入重试
-        const { addToRetryQueue } = require('../services/callbackService');
-        addToRetryQueue(item.task, item.data);
-      }
-    });
-
-    await Promise.all(promises);
+    if (callbackHealth.degraded) {
+      await callbackProcessOne();
+    } else {
+      await callbackProcessBatch();
+    }
   }
   activeCallbackWorkers--;
+}
+
+/** 检查回调任务是否超时 */
+function isCallbackTaskExpired(item) {
+  if (!item.task.created_at) return false;
+  const age = Date.now() - new Date(item.task.created_at).getTime();
+  if (age > 290000) {
+    logger.info(`回调任务已超时丢弃: shop_id=${item.task.shop_id} item_id=${item.task.item_id} created_at=${item.task.created_at} age=${(age / 1000).toFixed(0)}s`);
+    taskQueue.removeKey(item.task);
+    return true;
+  }
+  return false;
+}
+
+/** 回调失败处理 */
+function handleCallbackFailure(item) {
+  const { addToRetryQueue } = require('../services/callbackService');
+  addToRetryQueue(item.task, item.data);
+}
+
+/** 正常模式：批量并发回调 */
+async function callbackProcessBatch() {
+  const batchSize = Math.min(8, callbackQueue.length);
+  const items = [];
+  for (let i = 0; i < batchSize; i++) {
+    const item = callbackQueue.shift();
+    if (item) items.push(item);
+  }
+  if (items.length === 0) return;
+
+  const promises = items.map(async (item) => {
+    if (isCallbackTaskExpired(item)) return;
+
+    try {
+      const ok = await callbackSingle(item.task, item.data);
+      recordSample(callbackHealth, false, '回调');
+      logTask('callback', ok, item.task.shop_id, item.task.item_id);
+      if (!ok) handleCallbackFailure(item);
+    } catch (err) {
+      const isTimeout = !!(err.message && err.message.includes('timeout'));
+      recordSample(callbackHealth, isTimeout, '回调');
+      logTask('callback', false, item.task.shop_id, item.task.item_id);
+      handleCallbackFailure(item);
+    }
+  });
+
+  await Promise.all(promises);
+}
+
+/** 降级模式：串行回调 */
+async function callbackProcessOne() {
+  const item = callbackQueue.shift();
+  if (!item) return;
+
+  if (isCallbackTaskExpired(item)) return;
+
+  try {
+    const ok = await callbackSingle(item.task, item.data);
+    recordSample(callbackHealth, false, '回调');
+    logTask('callback', ok, item.task.shop_id, item.task.item_id);
+    if (!ok) handleCallbackFailure(item);
+  } catch (err) {
+    const isTimeout = !!(err.message && err.message.includes('timeout'));
+    recordSample(callbackHealth, isTimeout, '回调');
+    logTask('callback', false, item.task.shop_id, item.task.item_id);
+    handleCallbackFailure(item);
+  }
 }
 
 /**
@@ -245,7 +461,10 @@ function statsLoop() {
   const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
   const deltaTimeout = queueTimeoutCount - lastStatsQueueTimeoutCount;
 
-  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers} cb=${activeCallbackWorkers}`);
+  const queryMode = queryHealth.degraded ? '降级' : '正常';
+  const cbMode = callbackHealth.degraded ? '降级' : '正常';
+
+  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
@@ -372,11 +591,13 @@ function getStats() {
     activePullWorkers,
     activeQueryWorkers,
     activeCallbackWorkers,
+    queryDegraded: queryHealth.degraded,
+    callbackDegraded: callbackHealth.degraded,
     callbackQueueLength: callbackQueue.length,
     pullCount,
     pullDupCount,
     querySkipCount,
-    queueTimeoutCount,  // 队列中超时统计
+    queueTimeoutCount,
   };
 }
 
@@ -387,4 +608,4 @@ function isRunning() {
   return !workersStopped;
 }
 
-module.exports = { start, stop, startPulling, stopPulling, getStats, isRunning };
+module.exports = { start, stop, startPulling, stopPulling, getStats, isRunning, drainTaskLogs, getTaskLogHistory };

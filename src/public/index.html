@@ -53,16 +53,26 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .scheduler-status.stopped { background: rgba(244,67,54,0.2); color: #f44336; }
 .scheduler-status.sleeping { background: rgba(255,152,0,0.2); color: #ff9800; }
 
-/* 日志面板 */
-.log-section { padding: 0 24px 24px; }
-.log-section h3 { font-size: 14px; color: #4fc3f7; margin-bottom: 8px; }
-.log-container { background: #0a1520; border-radius: 8px; padding: 12px; height: 280px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; line-height: 1.6; border: 1px solid #1a2a3a; }
-.log-line { white-space: pre-wrap; word-break: break-all; }
-.log-line.error { color: #ef5350; }
-.log-line.warn { color: #ffa726; }
-.log-line.success { color: #66bb6a; }
-.log-line.info { color: #b0bec5; }
-.log-line.control { color: #42a5f5; }
+/* 任务日志三面板 */
+.task-logs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 0 24px 24px; }
+.task-log-panel { background: #1a2a3a; border-radius: 8px; padding: 12px; }
+.task-log-panel h3 { font-size: 14px; color: #4fc3f7; margin-bottom: 8px; border-bottom: 1px solid #2d4a5e; padding-bottom: 6px; }
+.task-log-box { background: #0a1520; border-radius: 6px; padding: 8px; height: 260px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; line-height: 1.7; border: 1px solid #1a2a3a; }
+.tl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl .ts { color: #607d8b; }
+.tl.ok .st { color: #ef5350; font-weight: bold; }
+.tl.fail .st { color: #66bb6a; font-weight: bold; }
+.tl .id { color: #90a4ae; }
+
+/* 系统日志（折叠） */
+.sys-log-section { padding: 0 24px 24px; }
+.sys-log-toggle { font-size: 13px; color: #607d8b; cursor: pointer; user-select: none; }
+.sys-log-toggle:hover { color: #90a4ae; }
+.sys-log-box { background: #0a1520; border-radius: 8px; padding: 12px; height: 160px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px; line-height: 1.5; border: 1px solid #1a2a3a; display: none; margin-top: 8px; }
+.sys-log-box.open { display: block; }
+.sl { white-space: pre-wrap; word-break: break-all; color: #607d8b; }
+.sl.err { color: #ef5350; }
+.sl.wrn { color: #ffa726; }
 </style>
 </head>
 <body>
@@ -132,24 +142,55 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <span class="scheduler-status stopped" id="scheduler-status">已停止</span>
 </div>
 
-<div class="log-section">
-  <h3>实时日志</h3>
-  <div class="log-container" id="log-container"></div>
+<div class="task-logs">
+  <div class="task-log-panel">
+    <h3>拉取任务</h3>
+    <div class="task-log-box" id="tl-pull"></div>
+  </div>
+  <div class="task-log-panel">
+    <h3>查询任务</h3>
+    <div class="task-log-box" id="tl-query"></div>
+  </div>
+  <div class="task-log-panel">
+    <h3>回调任务</h3>
+    <div class="task-log-box" id="tl-callback"></div>
+  </div>
+</div>
+
+<div class="sys-log-section">
+  <span class="sys-log-toggle" id="sys-toggle" onclick="toggleSysLog()">&#9654; 系统日志</span>
+  <div class="sys-log-box" id="sys-log"></div>
 </div>
 
 <script>
-let ws = null;
-let startTime = Date.now();
-let reconnectTimer = null;
+var ws = null;
+var startTime = Date.now();
+var reconnectTimer = null;
+var reconnectDelay = 3000;
+var maxReconnectDelay = 30000;
+var connecting = false;
+
+var pendingStats = null;
+var pendingSysLogs = [];
+var pendingTaskLogs = { pull: [], query: [], callback: [] };
+var rafId = null;
+var MAX_LINES = 150;
 
 function $(id) { return document.getElementById(id); }
 
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
 function formatUptime(ms) {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
+  var s = Math.floor(ms / 1000);
+  var h = Math.floor(s / 3600);
+  var m = Math.floor((s % 3600) / 60);
+  var sec = s % 60;
   return (h > 0 ? h + 'h ' : '') + m + 'm ' + sec + 's';
+}
+
+function formatTs(ts) {
+  var d = new Date(ts);
+  return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
 }
 
 setInterval(function() {
@@ -157,8 +198,8 @@ setInterval(function() {
 }, 1000);
 
 function setConnected(connected) {
-  const dot = $('connDot');
-  const text = $('connText');
+  var dot = $('connDot');
+  var text = $('connText');
   if (connected) {
     dot.className = 'status-dot connected';
     text.textContent = '已连接';
@@ -169,13 +210,11 @@ function setConnected(connected) {
 }
 
 function updateStats(data) {
-  // 核心指标
   $('m-callback-success').textContent = data.callbackSuccess || 0;
   $('m-queue-length').textContent = data.queuePending || 0;
   $('m-query-success').textContent = (data.queryStats && data.queryStats.successCount) || 0;
   $('m-dropped').textContent = data.callbackDropped || 0;
 
-  // 数据请求统计
   if (data.queryStats) {
     $('s-total-requests').textContent = data.queryStats.totalRequests || 0;
     $('s-query-success').textContent = data.queryStats.successCount || 0;
@@ -185,7 +224,6 @@ function updateStats(data) {
     $('s-query-rate').textContent = data.queryStats.queryRatePerMin || 0;
   }
 
-  // 客户接口统计
   $('s-cb-success').textContent = data.callbackSuccess || 0;
   $('s-cb-dropped').textContent = data.callbackDropped || 0;
   $('s-retry-queue').textContent = data.retryQueueLength || 0;
@@ -197,7 +235,6 @@ function updateStats(data) {
     $('s-pull-rate').textContent = data.pullStats.pullRatePerMin || 0;
   }
 
-  // 队列状态
   if (data.queueStats) {
     $('s-q-pending').textContent = data.queueStats.pending || 0;
     $('s-q-dedupe').textContent = data.queueStats.dedupeKeys || 0;
@@ -211,7 +248,6 @@ function updateStats(data) {
     $('s-workers').textContent = (data.schedulerStats.activePullWorkers || 0) + '/' + (data.schedulerStats.activeQueryWorkers || 0) + '/' + (data.schedulerStats.activeCallbackWorkers || 0);
   }
 
-  // 调度器状态
   var statusEl = $('scheduler-status');
   if (data.schedulerStats && data.schedulerStats.autoPaused) {
     statusEl.className = 'scheduler-status sleeping';
@@ -224,63 +260,134 @@ function updateStats(data) {
     statusEl.textContent = '已停止';
   }
 
-  // 按钮状态
   $('btn-start').disabled = data.schedulerRunning;
   $('btn-stop').disabled = !data.schedulerRunning;
   $('btn-pull-start').disabled = !data.schedulerRunning || (data.schedulerStats && !data.schedulerStats.pullingPaused && !data.schedulerStats.autoPaused);
   $('btn-pull-stop').disabled = !data.schedulerRunning || (data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.autoPaused));
 }
 
-function classifyLog(text) {
-  if (/\[ERROR\]/i.test(text)) return 'error';
-  if (/\[WARN\]/i.test(text)) return 'warn';
-  if (/成功/.test(text)) return 'success';
-  if (/调度器|启动|停止|拉取|休眠/.test(text)) return 'control';
-  return 'info';
+// ======== 任务日志渲染 ========
+function renderTaskLogEntry(entry) {
+  var div = document.createElement('div');
+  div.className = 'tl ' + (entry.ok ? 'ok' : 'fail');
+  var html = '<span class="ts">' + formatTs(entry.ts) + '</span> ';
+  html += '<span class="st">' + (entry.ok ? '成功' : '失败') + '</span>';
+  if (entry.sid) {
+    html += ' <span class="id">' + entry.sid;
+    if (entry.iid) html += ' ' + entry.iid;
+    html += '</span>';
+  }
+  div.innerHTML = html;
+  return div;
 }
 
-function appendLogs(logs) {
-  var container = $('log-container');
-  var atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 30;
+function flushTaskLogs(containerId, entries) {
+  var box = $(containerId);
+  var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
 
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < entries.length; i++) {
+    frag.appendChild(renderTaskLogEntry(entries[i]));
+  }
+  box.appendChild(frag);
+
+  var overflow = box.children.length - MAX_LINES;
+  if (overflow > 0) {
+    var range = document.createRange();
+    range.setStartBefore(box.firstChild);
+    range.setEndAfter(box.children[overflow - 1]);
+    range.deleteContents();
+  }
+
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+// ======== 系统日志（可折叠）========
+var sysLogOpen = false;
+function toggleSysLog() {
+  sysLogOpen = !sysLogOpen;
+  var box = $('sys-log');
+  var toggle = $('sys-toggle');
+  if (sysLogOpen) {
+    box.className = 'sys-log-box open';
+    toggle.innerHTML = '&#9660; 系统日志';
+  } else {
+    box.className = 'sys-log-box';
+    toggle.innerHTML = '&#9654; 系统日志';
+  }
+}
+
+function flushSysLogs(logs) {
+  var box = $('sys-log');
+  var atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+
+  var frag = document.createDocumentFragment();
   for (var i = 0; i < logs.length; i++) {
     var div = document.createElement('div');
-    div.className = 'log-line ' + classifyLog(logs[i]);
+    var cls = 'sl';
+    if (logs[i].indexOf('[ERROR]') !== -1) cls += ' err';
+    else if (logs[i].indexOf('[WARN]') !== -1) cls += ' wrn';
+    div.className = cls;
     div.textContent = logs[i];
-    container.appendChild(div);
+    frag.appendChild(div);
+  }
+  box.appendChild(frag);
+
+  var overflow = box.children.length - MAX_LINES;
+  if (overflow > 0) {
+    var range = document.createRange();
+    range.setStartBefore(box.firstChild);
+    range.setEndAfter(box.children[overflow - 1]);
+    range.deleteContents();
   }
 
-  // 限制日志行数
-  while (container.children.length > 500) {
-    container.removeChild(container.firstChild);
-  }
+  if (atBottom) box.scrollTop = box.scrollHeight;
+}
 
-  if (atBottom) {
-    container.scrollTop = container.scrollHeight;
+// ======== rAF 统一渲染 ========
+function scheduleRender() {
+  if (rafId) return;
+  rafId = requestAnimationFrame(function() {
+    rafId = null;
+    if (pendingStats) {
+      updateStats(pendingStats);
+      pendingStats = null;
+    }
+    if (pendingTaskLogs.pull.length) { flushTaskLogs('tl-pull', pendingTaskLogs.pull); pendingTaskLogs.pull = []; }
+    if (pendingTaskLogs.query.length) { flushTaskLogs('tl-query', pendingTaskLogs.query); pendingTaskLogs.query = []; }
+    if (pendingTaskLogs.callback.length) { flushTaskLogs('tl-callback', pendingTaskLogs.callback); pendingTaskLogs.callback = []; }
+    if (pendingSysLogs.length) { flushSysLogs(pendingSysLogs); pendingSysLogs = []; }
+  });
+}
+
+function bufferTaskLogs(data) {
+  var channels = ['pull', 'query', 'callback'];
+  for (var c = 0; c < channels.length; c++) {
+    var ch = channels[c];
+    if (data[ch] && data[ch].length) {
+      for (var i = 0; i < data[ch].length; i++) {
+        pendingTaskLogs[ch].push(data[ch][i]);
+      }
+      if (pendingTaskLogs[ch].length > MAX_LINES) {
+        pendingTaskLogs[ch] = pendingTaskLogs[ch].slice(-MAX_LINES);
+      }
+    }
   }
 }
 
+// ======== WebSocket 连接 ========
 function sendCmd(cmd) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'command', command: cmd }));
   }
 }
 
-var reconnectDelay = 3000;
-var maxReconnectDelay = 30000;
-var connecting = false;
-
 function connect() {
   if (connecting) return;
   connecting = true;
 
-  // 关闭旧连接
   if (ws) {
-    try {
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.close();
-    } catch (e) {}
+    try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) {}
     ws = null;
   }
 
@@ -296,22 +403,23 @@ function connect() {
 
   ws.onopen = function() {
     connecting = false;
-    reconnectDelay = 3000; // 连接成功后重置退避时间
+    reconnectDelay = 3000;
     setConnected(true);
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   };
 
   ws.onmessage = function(e) {
     try {
       var msg = JSON.parse(e.data);
       if (msg.type === 'stats') {
-        updateStats(msg.data);
+        pendingStats = msg.data;
+      } else if (msg.type === 'taskLogs') {
+        bufferTaskLogs(msg.data);
       } else if (msg.type === 'logs') {
-        appendLogs(msg.data);
+        for (var i = 0; i < msg.data.length; i++) pendingSysLogs.push(msg.data[i]);
+        if (pendingSysLogs.length > MAX_LINES) pendingSysLogs = pendingSysLogs.slice(-MAX_LINES);
       }
+      scheduleRender();
     } catch (err) {}
   };
 
@@ -324,7 +432,6 @@ function connect() {
   ws.onerror = function() {
     connecting = false;
     setConnected(false);
-    // onclose 会在 onerror 之后触发，由 onclose 处理重连
   };
 }
 
@@ -334,7 +441,6 @@ function scheduleReconnect() {
     reconnectTimer = null;
     connect();
   }, reconnectDelay);
-  // 指数退避：每次失败后延迟翻倍，最大30秒
   reconnectDelay = Math.min(reconnectDelay * 2, maxReconnectDelay);
 }
 

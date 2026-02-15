@@ -4,9 +4,9 @@ const https = require('https');
 const config = require('../config');
 const logger = require('./logger');
 
-// 连接复用 Agent
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
+// 连接复用 Agent，限制最大连接数防止网络拥塞时 socket 堆积
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 30 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 /**
  * 上游拉取任务 HTTP 客户端（103.207.68.206:3000）

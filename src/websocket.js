@@ -45,6 +45,10 @@ function setupWebSocket(server) {
       safeSend(ws, JSON.stringify({ type: 'logs', data: recent }));
     }
 
+    // 发送任务日志历史
+    const taskHistory = scheduler.getTaskLogHistory();
+    safeSend(ws, JSON.stringify({ type: 'taskLogs', data: taskHistory }));
+
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw);
@@ -84,7 +88,8 @@ function setupWebSocket(server) {
   // 每秒广播统计数据和增量日志
   setInterval(() => {
     if (wss.clients.size === 0) {
-      logger.drainLogs(); // 即使无客户端也清空，防止堆积
+      logger.drainLogs();
+      scheduler.drainTaskLogs(); // 无客户端也清空，防止堆积
       return;
     }
 
@@ -106,9 +111,17 @@ function setupWebSocket(server) {
       logsMsg = JSON.stringify({ type: 'logs', data: logsToSend });
     }
 
+    // 任务级日志
+    const newTaskLogs = scheduler.drainTaskLogs();
+    let taskLogsMsg = null;
+    if (newTaskLogs.pull.length || newTaskLogs.query.length || newTaskLogs.callback.length) {
+      taskLogsMsg = JSON.stringify({ type: 'taskLogs', data: newTaskLogs });
+    }
+
     wss.clients.forEach((client) => {
       if (statsMsg) safeSend(client, statsMsg);
       if (logsMsg) safeSend(client, logsMsg);
+      if (taskLogsMsg) safeSend(client, taskLogsMsg);
     });
   }, 1000);
 
