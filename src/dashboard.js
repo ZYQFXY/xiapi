@@ -16,6 +16,10 @@ function createDashboard() {
     smartCSR: true,
     title: '虾皮数据服务控制台',
     fullUnicode: true,
+    forceUnicode: false,
+    dockBorders: true,
+    ignoreLocked: ['C-c'],
+    warnings: true,
   });
 
   // ========== 标题栏 ==========
