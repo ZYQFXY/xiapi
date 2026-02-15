@@ -51,6 +51,7 @@ async function pullSingleTask() {
       trace_id: taskData.trace_id,
       type: taskType,              // 保留任务类型供回调使用
       created_at: taskData.created_at,
+      token: taskData.token,
     };
   } catch (err) {
     logger.warn(`拉取任务失败: ${err.message}`);

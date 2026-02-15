@@ -1,4 +1,4 @@
-const blessed = require('blessed');
+const blessed = require('neo-blessed');
 const config = require('./config');
 const scheduler = require('./scheduler/scheduler');
 const taskQueue = require('./queue/taskQueue');

@@ -1,9 +1,8 @@
 **获取新任务**
    ```bash
-   GET http://101.34.226.247/api/get/newtask?phone=18888888888&country=tw
+   GET http://103.207.68.206:3000/api/get/task?phone=xxx
    ```
    
-
    响应示例：
    ```json
    {
@@ -18,7 +17,8 @@
          "country": "tw",
          "trace_id": "trace_001",
          "type": "some_type",
-         "created_at": "2024-01-01 12:00:00"
+         "created_at": "2024-01-01 12:00:00",
+         "token": "新增字段 token"
        }
      }
    }
@@ -27,7 +27,7 @@
 
 **上传任务**
 - **方法**: POST
-- **URL**: `http://118.25.45.42:9000/task/api/complete/upload`
+- **URL**: `http://103.207.68.206:9000/task/api/json/upload`
 - **说明**: 
 
 ### 参数
@@ -40,8 +40,9 @@
     "good_id": "商品id",
     "country": "国家",
     "trace_id": "任务id",
-    "content": "商品数据内容json字符串",
-    "phone": "18888888888"
+    "content": "商品JSON数据转对象",
+    "phone": "手机号",
+    "token": "新增字段 token"
   }
 }
 ```
@@ -58,3 +59,5 @@
   "data": {}
 }
 ```
+
+

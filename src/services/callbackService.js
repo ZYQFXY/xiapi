@@ -33,6 +33,7 @@ async function callbackSingle(task, data) {
         trace_id: task.trace_id,
         content: data && data.response ? data.response : data,
         phone: config.upstream.phone,
+        token: task.token,
       },
     }, {
       timeout: config.callbackTimeout,
