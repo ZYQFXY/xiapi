@@ -203,6 +203,7 @@ function createDashboard() {
       `${padLabel('拉取时已过期:', `{yellow-fg}${ps.pullExpired}{/yellow-fg}`, colWidth)}\n` +
       `${padLabel('数据回传成功:', `{green-fg}${cbSuccess}{/green-fg}`, colWidth)}\n` +
       `${padLabel('成功任务数:', `{green-fg}${qs.successCount}{/green-fg}`, colWidth)}\n` +
+      `${padLabel('商品下架:', `{gray-fg}${qs.offlineCount}{/gray-fg}`, colWidth)}\n` +
       `${padLabel('废弃任务数:', `{red-fg}${abandonedCount}{/red-fg}`, colWidth)}`
     );
 
