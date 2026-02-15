@@ -3,15 +3,18 @@ const config = require('../config');
 const logger = require('../utils/logger');
 
 // 需要重试的错误码
-const RETRY_ERROR_CODE = 1000000; // Unknown error
-const PROCESSING_ERROR_CODE = 1100002; // Product is being processed
+const RETRY_ERROR_CODES = [
+  1000000, // Unknown error
+  1100002  // Product is being processed
+];
 
 // 数据提供方请求统计
 const queryStats = {
-  totalRequests: 0,
-  successCount: 0,      // _success=true 且 data 包含 item
-  processingCount: 0,   // HTTP 400, code=1100002（商品处理中）
-  failureCount: 0,      // 网络异常或 code=1000000（需重试）
+  totalRequests: 0,     // 总请求数（包括重试）
+  successCount: 0,      // 查询成功（_success=true 且有 item 数据）
+  failureCount: 0,      // 查询失败（需要重试的请求：1000000、1100002、网络异常）
+  offlineCount: 0,      // 商品下架（_success=false 无 item、其他错误码等）
+  processingCount: 0,   // 商品处理中的次数（1100002，包含在 failureCount 中）
 };
 
 /**
@@ -29,8 +32,8 @@ function hasValidItemData(body) {
  * 查询单个商品详情
  * @param {Object} task - 任务对象
  * @returns {Object} { task, success, data }
- *   success=true  → 查询成功 或 已有明确结果（如1100002），需回调
- *   success=false → 未知错误（1000000）或网络异常，需重试
+ *   success=true  → 查询成功，需回调
+ *   success=false → 未知错误（1000000）、商品处理中（1100002）或网络异常，需重试
  */
 async function querySingle(task) {
   queryStats.totalRequests++;
@@ -48,12 +51,13 @@ async function querySingle(task) {
     if (body && body._success === true) {
       if (hasValidItemData(body)) {
         queryStats.successCount++;
+        return { task, success: true, data: body };
       }
-      return { task, success: true, data: body };
     }
 
-    // HTTP 200 但 _success=false，当作有结果，直接回调
-    logger.info(`查询返回(_success=false): shop_id=${task.shop_id} item_id=${task.item_id}`);
+    // HTTP 200 但 _success=false 或无 item 数据，当作商品下架，直接回调
+    queryStats.offlineCount++;
+    logger.info(`查询返回(商品下架): shop_id=${task.shop_id} item_id=${task.item_id}`);
     return { task, success: true, data: body };
   } catch (err) {
     // HTTP 400 等错误，检查响应体中的错误码
@@ -62,22 +66,21 @@ async function querySingle(task) {
       const errCode = errBody.error && errBody.error.code;
       const errMsg = errBody.error && errBody.error.message;
 
-      if (errCode === RETRY_ERROR_CODE) {
-        // code 1000000: Unknown error → 重试
+      // 检查是否为需要重试的错误码
+      if (RETRY_ERROR_CODES.includes(errCode)) {
         queryStats.failureCount++;
-        logger.warn(`查询失败(需重试): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
+        if (errCode === 1100002) {
+          queryStats.processingCount++;
+          logger.warn(`查询失败(商品处理中，需重试): shop_id=${task.shop_id} item_id=${task.item_id}`);
+        } else {
+          logger.warn(`查询失败(需重试): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
+        }
         return { task, success: false, data: null };
       }
 
-      if (errCode === PROCESSING_ERROR_CODE) {
-        // code 1100002: Product is being processed → 商品处理中
-        queryStats.processingCount++;
-        logger.info(`查询返回(商品处理中): shop_id=${task.shop_id} item_id=${task.item_id}`);
-        return { task, success: true, data: errBody };
-      }
-
-      // 其他错误码 → 不重试，直接回调
-      logger.info(`查询返回(${errCode}): shop_id=${task.shop_id} item_id=${task.item_id} msg=${errMsg}`);
+      // 其他错误码 → 不重试，当作商品下架，直接回调
+      queryStats.offlineCount++;
+      logger.info(`查询返回(商品下架): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
       return { task, success: true, data: errBody };
     }
 

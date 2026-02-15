@@ -183,12 +183,13 @@ function createDashboard() {
     const cbDropped = getTotalDroppedCount();
 
     // 数据提供方请求统计
-    const endpointTotal = qs.successCount + qs.processingCount;
+    const endpointTotal = qs.successCount + qs.failureCount + qs.offlineCount;
     const colWidth = 24;
     providerBox.setContent(
       `${padLabel('请求总数:', qs.totalRequests, colWidth)}\n` +
       `${padLabel('成功数:', `{green-fg}${qs.successCount}{/green-fg}`, colWidth)}\n` +
       `${padLabel('失败数:', `{red-fg}${qs.failureCount}{/red-fg}`, colWidth)}\n` +
+      `${padLabel('商品下架:', `{gray-fg}${qs.offlineCount}{/gray-fg}`, colWidth)}\n` +
       `${padLabel('商品处理中:', `{yellow-fg}${qs.processingCount}{/yellow-fg}`, colWidth)}\n` +
       `${padLabel('端口总和:', endpointTotal, colWidth)}`
     );
