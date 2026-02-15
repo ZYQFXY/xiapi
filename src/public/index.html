@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>虾皮数据服务控制台 - 2号客户接口1</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1923; color: #e0e0e0; min-height: 100vh; }
+
+/* 顶部标题栏 */
+.header { background: #1a2a3a; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #2d4a5e; }
+.header h1 { font-size: 18px; color: #4fc3f7; }
+.header-right { display: flex; gap: 20px; font-size: 13px; color: #90a4ae; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.status-dot.connected { background: #4caf50; }
+.status-dot.disconnected { background: #f44336; }
+
+/* 指标卡片 */
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 16px 24px; }
+.metric-card { background: #1a2a3a; border-radius: 8px; padding: 16px; border-left: 4px solid; }
+.metric-card.green { border-color: #4caf50; }
+.metric-card.blue { border-color: #2196f3; }
+.metric-card.red { border-color: #f44336; }
+.metric-card .label { font-size: 13px; color: #90a4ae; margin-bottom: 8px; }
+.metric-card .value { font-size: 28px; font-weight: bold; }
+.metric-card.green .value { color: #4caf50; }
+.metric-card.blue .value { color: #2196f3; }
+.metric-card.red .value { color: #f44336; }
+
+/* 统计面板 */
+.panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 0 24px 16px; }
+.panel { background: #1a2a3a; border-radius: 8px; padding: 16px; }
+.panel h3 { font-size: 14px; color: #4fc3f7; margin-bottom: 12px; border-bottom: 1px solid #2d4a5e; padding-bottom: 8px; }
+.stat-row { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+.stat-row .stat-label { color: #90a4ae; }
+.stat-row .stat-value { color: #e0e0e0; font-family: 'Consolas', monospace; }
+
+/* 控制按钮 */
+.controls { padding: 0 24px 16px; display: flex; gap: 12px; align-items: center; }
+.controls .label { font-size: 13px; color: #90a4ae; margin-right: 8px; }
+.btn { padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: opacity 0.2s; }
+.btn:hover { opacity: 0.85; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-start { background: #4caf50; color: #fff; }
+.btn-stop { background: #f44336; color: #fff; }
+.btn-pull-start { background: #2196f3; color: #fff; }
+.btn-pull-stop { background: #ff9800; color: #fff; }
+.scheduler-status { font-size: 13px; margin-left: 12px; padding: 4px 12px; border-radius: 4px; }
+.scheduler-status.running { background: rgba(76,175,80,0.2); color: #4caf50; }
+.scheduler-status.stopped { background: rgba(244,67,54,0.2); color: #f44336; }
+.scheduler-status.sleeping { background: rgba(255,152,0,0.2); color: #ff9800; }
+
+/* 日志面板 */
+.log-section { padding: 0 24px 24px; }
+.log-section h3 { font-size: 14px; color: #4fc3f7; margin-bottom: 8px; }
+.log-container { background: #0a1520; border-radius: 8px; padding: 12px; height: 280px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; line-height: 1.6; border: 1px solid #1a2a3a; }
+.log-line { white-space: pre-wrap; word-break: break-all; }
+.log-line.error { color: #ef5350; }
+.log-line.warn { color: #ffa726; }
+.log-line.success { color: #66bb6a; }
+.log-line.info { color: #b0bec5; }
+.log-line.control { color: #42a5f5; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>虾皮数据服务控制台 - 2号客户接口1</h1>
+  <div class="header-right">
+    <span>运行时间: <span id="uptime">--</span></span>
+    <span><span class="status-dot disconnected" id="connDot"></span><span id="connText">未连接</span></span>
+  </div>
+</div>
+
+<div class="metrics">
+  <div class="metric-card green">
+    <div class="label">回调成功数</div>
+    <div class="value" id="m-callback-success">0</div>
+  </div>
+  <div class="metric-card blue">
+    <div class="label">队列长度</div>
+    <div class="value" id="m-queue-length">0</div>
+  </div>
+  <div class="metric-card green">
+    <div class="label">成功任务数</div>
+    <div class="value" id="m-query-success">0</div>
+  </div>
+  <div class="metric-card red">
+    <div class="label">废弃任务数</div>
+    <div class="value" id="m-dropped">0</div>
+  </div>
+</div>
+
+<div class="panels">
+  <div class="panel">
+    <h3>数据请求统计</h3>
+    <div class="stat-row"><span class="stat-label">总请求数</span><span class="stat-value" id="s-total-requests">0</span></div>
+    <div class="stat-row"><span class="stat-label">查询成功</span><span class="stat-value" id="s-query-success">0</span></div>
+    <div class="stat-row"><span class="stat-label">查询失败(重试)</span><span class="stat-value" id="s-query-failure">0</span></div>
+    <div class="stat-row"><span class="stat-label">商品下架</span><span class="stat-value" id="s-offline">0</span></div>
+    <div class="stat-row"><span class="stat-label">商品处理中</span><span class="stat-value" id="s-processing">0</span></div>
+  </div>
+  <div class="panel">
+    <h3>客户接口统计</h3>
+    <div class="stat-row"><span class="stat-label">回调成功总数</span><span class="stat-value" id="s-cb-success">0</span></div>
+    <div class="stat-row"><span class="stat-label">废弃任务数</span><span class="stat-value" id="s-cb-dropped">0</span></div>
+    <div class="stat-row"><span class="stat-label">重试队列长度</span><span class="stat-value" id="s-retry-queue">0</span></div>
+    <div class="stat-row"><span class="stat-label">拉取总数</span><span class="stat-value" id="s-pull-total">0</span></div>
+    <div class="stat-row"><span class="stat-label">拉取过期丢弃</span><span class="stat-value" id="s-pull-expired">0</span></div>
+  </div>
+  <div class="panel">
+    <h3>队列状态</h3>
+    <div class="stat-row"><span class="stat-label">待处理任务</span><span class="stat-value" id="s-q-pending">0</span></div>
+    <div class="stat-row"><span class="stat-label">去重键数</span><span class="stat-value" id="s-q-dedupe">0</span></div>
+    <div class="stat-row"><span class="stat-label">拉取去重</span><span class="stat-value" id="s-pull-dup">0</span></div>
+    <div class="stat-row"><span class="stat-label">超时丢弃</span><span class="stat-value" id="s-query-skip">0</span></div>
+    <div class="stat-row"><span class="stat-label">队列中超时</span><span class="stat-value" id="s-queue-timeout">0</span></div>
+    <div class="stat-row"><span class="stat-label">回调队列</span><span class="stat-value" id="s-cb-queue">0</span></div>
+    <div class="stat-row"><span class="stat-label">工作线程(拉/查/回)</span><span class="stat-value" id="s-workers">0/0/0</span></div>
+  </div>
+</div>
+
+<div class="controls">
+  <span class="label">调度器控制:</span>
+  <button class="btn btn-start" id="btn-start" onclick="sendCmd('startScheduler')">启动任务</button>
+  <button class="btn btn-stop" id="btn-stop" onclick="sendCmd('stopScheduler')">停止任务</button>
+  <button class="btn btn-pull-start" id="btn-pull-start" onclick="sendCmd('startPulling')">启动拉取</button>
+  <button class="btn btn-pull-stop" id="btn-pull-stop" onclick="sendCmd('stopPulling')">停止拉取</button>
+  <span class="scheduler-status stopped" id="scheduler-status">已停止</span>
+</div>
+
+<div class="log-section">
+  <h3>实时日志</h3>
+  <div class="log-container" id="log-container"></div>
+</div>
+
+<script>
+let ws = null;
+let startTime = Date.now();
+let reconnectTimer = null;
+
+function $(id) { return document.getElementById(id); }
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return (h > 0 ? h + 'h ' : '') + m + 'm ' + sec + 's';
+}
+
+setInterval(function() {
+  $('uptime').textContent = formatUptime(Date.now() - startTime);
+}, 1000);
+
+function setConnected(connected) {
+  const dot = $('connDot');
+  const text = $('connText');
+  if (connected) {
+    dot.className = 'status-dot connected';
+    text.textContent = '已连接';
+  } else {
+    dot.className = 'status-dot disconnected';
+    text.textContent = '未连接';
+  }
+}
+
+function updateStats(data) {
+  // 核心指标
+  $('m-callback-success').textContent = data.callbackSuccess || 0;
+  $('m-queue-length').textContent = data.queuePending || 0;
+  $('m-query-success').textContent = (data.queryStats && data.queryStats.successCount) || 0;
+  $('m-dropped').textContent = data.callbackDropped || 0;
+
+  // 数据请求统计
+  if (data.queryStats) {
+    $('s-total-requests').textContent = data.queryStats.totalRequests || 0;
+    $('s-query-success').textContent = data.queryStats.successCount || 0;
+    $('s-query-failure').textContent = data.queryStats.failureCount || 0;
+    $('s-offline').textContent = data.queryStats.offlineCount || 0;
+    $('s-processing').textContent = data.queryStats.processingCount || 0;
+  }
+
+  // 客户接口统计
+  $('s-cb-success').textContent = data.callbackSuccess || 0;
+  $('s-cb-dropped').textContent = data.callbackDropped || 0;
+  $('s-retry-queue').textContent = data.retryQueueLength || 0;
+
+  if (data.pullStats) {
+    $('s-pull-total').textContent = data.pullStats.totalPulled || 0;
+    $('s-pull-expired').textContent = data.pullStats.pullExpired || 0;
+  }
+
+  // 队列状态
+  if (data.queueStats) {
+    $('s-q-pending').textContent = data.queueStats.pending || 0;
+    $('s-q-dedupe').textContent = data.queueStats.dedupeKeys || 0;
+  }
+
+  if (data.schedulerStats) {
+    $('s-pull-dup').textContent = data.schedulerStats.pullDupCount || 0;
+    $('s-query-skip').textContent = data.schedulerStats.querySkipCount || 0;
+    $('s-queue-timeout').textContent = data.schedulerStats.queueTimeoutCount || 0;
+    $('s-cb-queue').textContent = data.schedulerStats.callbackQueueLength || 0;
+    $('s-workers').textContent = (data.schedulerStats.activePullWorkers || 0) + '/' + (data.schedulerStats.activeQueryWorkers || 0) + '/' + (data.schedulerStats.activeCallbackWorkers || 0);
+  }
+
+  // 调度器状态
+  var statusEl = $('scheduler-status');
+  if (data.schedulerStats && data.schedulerStats.sleeping) {
+    statusEl.className = 'scheduler-status sleeping';
+    statusEl.textContent = '休眠中';
+  } else if (data.schedulerRunning) {
+    statusEl.className = 'scheduler-status running';
+    statusEl.textContent = '运行中';
+  } else {
+    statusEl.className = 'scheduler-status stopped';
+    statusEl.textContent = '已停止';
+  }
+
+  // 按钮状态
+  $('btn-start').disabled = data.schedulerRunning;
+  $('btn-stop').disabled = !data.schedulerRunning;
+  $('btn-pull-start').disabled = !data.schedulerRunning || (data.schedulerStats && !data.schedulerStats.pullingPaused && !data.schedulerStats.sleeping);
+  $('btn-pull-stop').disabled = !data.schedulerRunning || (data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.sleeping));
+}
+
+function classifyLog(text) {
+  if (/\[ERROR\]/i.test(text)) return 'error';
+  if (/\[WARN\]/i.test(text)) return 'warn';
+  if (/成功/.test(text)) return 'success';
+  if (/调度器|启动|停止|拉取|休眠/.test(text)) return 'control';
+  return 'info';
+}
+
+function appendLogs(logs) {
+  var container = $('log-container');
+  var atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 30;
+
+  for (var i = 0; i < logs.length; i++) {
+    var div = document.createElement('div');
+    div.className = 'log-line ' + classifyLog(logs[i]);
+    div.textContent = logs[i];
+    container.appendChild(div);
+  }
+
+  // 限制日志行数
+  while (container.children.length > 500) {
+    container.removeChild(container.firstChild);
+  }
+
+  if (atBottom) {
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+function sendCmd(cmd) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'command', command: cmd }));
+  }
+}
+
+function connect() {
+  var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(protocol + '//' + location.host + '/ws');
+
+  ws.onopen = function() {
+    setConnected(true);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  };
+
+  ws.onmessage = function(e) {
+    try {
+      var msg = JSON.parse(e.data);
+      if (msg.type === 'stats') {
+        updateStats(msg.data);
+      } else if (msg.type === 'logs') {
+        appendLogs(msg.data);
+      }
+    } catch (err) {}
+  };
+
+  ws.onclose = function() {
+    setConnected(false);
+    scheduleReconnect();
+  };
+
+  ws.onerror = function() {
+    setConnected(false);
+  };
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(function() {
+    reconnectTimer = null;
+    connect();
+  }, 3000);
+}
+
+connect();
+</script>
+</body>
+</html>

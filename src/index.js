@@ -1,11 +1,14 @@
+const http = require('http');
+const path = require('path');
 const config = require('./config');
 const logger = require('./utils/logger');
 const express = require('express');
 const routes = require('./api/routes');
-const scheduler = require('./scheduler/scheduler');
+const { setupWebSocket } = require('./websocket');
 
 const app = express();
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 app.use('/', routes);
 
 // 全局未捕获异常处理
@@ -18,33 +21,30 @@ process.on('unhandledRejection', (reason) => {
   logger.error(`未处理Promise拒绝: ${reason}`);
 });
 
-// 检查是否使用控制台面板模式
-const useDashboard = process.argv.includes('--dashboard') || process.argv.includes('-d');
+// 启用 dashboard 模式（缓冲日志供 Web 面板读取）
+logger.enableDashboardMode();
+
+// 创建 HTTP 服务器（WebSocket 共享）
+const server = http.createServer(app);
+setupWebSocket(server);
 
 // 启动服务
-app.listen(config.port, () => {
+server.listen(config.port, () => {
   logger.info(`xiapi 服务启动，端口: ${config.port}`);
-
-  if (useDashboard) {
-    // Dashboard 模式：将日志重定向到缓冲区，启动控制台面板，等待用户手动启动任务
-    logger.enableDashboardMode();
-    const { createDashboard } = require('./dashboard');
-    createDashboard();
-  } else {
-    // 普通模式：自动启动调度器
-    scheduler.start();
-  }
+  logger.info(`Web 控制面板: http://localhost:${config.port}`);
 });
 
 // 优雅退出
 process.on('SIGINT', () => {
   logger.info('收到 SIGINT 信号，正在停止...');
+  const scheduler = require('./scheduler/scheduler');
   scheduler.stop();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
   logger.info('收到 SIGTERM 信号，正在停止...');
+  const scheduler = require('./scheduler/scheduler');
   scheduler.stop();
   process.exit(0);
 });

@@ -46,7 +46,6 @@ const logger = winston.createLogger({
 logger.enableDashboardMode = function () {
   if (dashboardMode) return;
   dashboardMode = true;
-  logger.remove(consoleTransport);
 
   const bufferStream = new Writable({
     write(chunk, encoding, callback) {
