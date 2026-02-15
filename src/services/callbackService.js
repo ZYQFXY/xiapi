@@ -15,6 +15,17 @@ let totalSuccessCount = 0;
 // 废弃任务总计数（重试超限丢弃）
 let totalDroppedCount = 0;
 
+// 每分钟回调次数统计（用于计算速率）
+const callbackCountHistory = []; // [{ timestamp: number, count: number }]
+
+function updateCallbackRate() {
+  const now = Date.now();
+  callbackCountHistory.push({ timestamp: now, count: 1 });
+  while (callbackCountHistory.length > 0 && now - callbackCountHistory[0].timestamp > 120000) {
+    callbackCountHistory.shift();
+  }
+}
+
 /**
  * 回调单个结果
  * POST /task/api/json/upload
@@ -42,6 +53,7 @@ async function callbackSingle(task, data) {
     // 回调成功，释放去重键
     taskQueue.removeKey(task);
     totalSuccessCount++;
+    updateCallbackRate();
     logger.info(`回调成功: shop_id=${task.shop_id} good_id=${task.good_id} (累计成功: ${totalSuccessCount})`);
     return true;
   } catch (err) {
@@ -164,6 +176,15 @@ function getTotalDroppedCount() {
   return totalDroppedCount;
 }
 
+function getCallbackRatePerMin() {
+  const now = Date.now();
+  const oneMinAgo = now - 60000;
+  const recentCount = callbackCountHistory
+    .filter(item => item.timestamp > oneMinAgo)
+    .reduce((sum, item) => sum + item.count, 0);
+  return recentCount;
+}
+
 module.exports = {
   callbackSingle,
   addToCallbackQueue,
@@ -174,4 +195,5 @@ module.exports = {
   getRetryQueueLength,
   getTotalSuccessCount,
   getTotalDroppedCount,
+  getCallbackRatePerMin,
 };

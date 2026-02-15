@@ -12,9 +12,11 @@ Do While Not objExec.StdOut.AtEndOfStream
 Loop
 
 If strOutput <> "" Then
-    ' 端口已占用，直接打开浏览器
-    objShell.Run "http://localhost:3000", 1, False
-    WScript.Quit
+    ' 端口已占用，提取 PID 并杀掉旧进程
+    arrParts = Split(Trim(strOutput))
+    strPID = arrParts(UBound(arrParts))
+    objShell.Run "cmd /c taskkill /PID " & strPID & " /F", 0, True
+    WScript.Sleep 1000
 End If
 
 ' 静默启动 node 服务

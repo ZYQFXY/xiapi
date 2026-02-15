@@ -17,6 +17,18 @@ const queryStats = {
   processingCount: 0,   // 商品处理中的次数（1100002，包含在 failureCount 中）
 };
 
+// 每分钟查询次数统计（用于计算速率）
+const queryCountHistory = []; // [{ timestamp: number, count: number }]
+
+function updateQueryRate() {
+  const now = Date.now();
+  queryCountHistory.push({ timestamp: now, count: 1 });
+  // 保留最近 2 分钟的数据
+  while (queryCountHistory.length > 0 && now - queryCountHistory[0].timestamp > 120000) {
+    queryCountHistory.shift();
+  }
+}
+
 /**
  * 检查响应是否包含有效的商品数据
  */
@@ -37,6 +49,7 @@ function hasValidItemData(body) {
  */
 async function querySingle(task) {
   queryStats.totalRequests++;
+  updateQueryRate();
 
   try {
     const res = await tokegeClient.post('/request/shopee/pdp', {
@@ -95,7 +108,12 @@ async function querySingle(task) {
  * 获取数据请求统计
  */
 function getQueryStats() {
-  return { ...queryStats };
+  const now = Date.now();
+  const oneMinAgo = now - 60000;
+  const recentCount = queryCountHistory
+    .filter(item => item.timestamp > oneMinAgo)
+    .reduce((sum, item) => sum + item.count, 0);
+  return { ...queryStats, queryRatePerMin: recentCount };
 }
 
 /**

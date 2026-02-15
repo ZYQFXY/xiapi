@@ -6,17 +6,27 @@ const {
   getTotalSuccessCount,
   getTotalDroppedCount,
   getRetryQueueLength,
+  getCallbackRatePerMin,
 } = require('./services/callbackService');
 const scheduler = require('./scheduler/scheduler');
 const taskQueue = require('./queue/taskQueue');
 
 let lastLogIndex = 0;
 
+const MAX_LOGS_PER_BROADCAST = 50;
+
 function setupWebSocket(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws) => {
     logger.info('WebSocket 客户端已连接');
+
+    // 发送历史日志
+    const history = logger.getLogBuffer();
+    if (history.length > 0) {
+      const recent = history.slice(-MAX_LOGS_PER_BROADCAST);
+      ws.send(JSON.stringify({ type: 'logs', data: recent }));
+    }
 
     ws.on('message', (raw) => {
       try {
@@ -36,17 +46,22 @@ function setupWebSocket(server) {
 
   // 每秒广播统计数据和增量日志
   setInterval(() => {
-    if (wss.clients.size === 0) return;
+    if (wss.clients.size === 0) {
+      logger.drainLogs(); // 即使无客户端也清空，防止堆积
+      return;
+    }
 
     const stats = collectStats();
     const statsMsg = JSON.stringify({ type: 'stats', data: stats });
 
-    const logBuffer = logger.getLogBuffer();
+    const newLogs = logger.drainLogs();
     let logsMsg = null;
-    if (logBuffer.length > lastLogIndex) {
-      const newLogs = logBuffer.slice(lastLogIndex);
-      lastLogIndex = logBuffer.length;
-      logsMsg = JSON.stringify({ type: 'logs', data: newLogs });
+    if (newLogs.length > 0) {
+      // 日志过多时只保留最新的，防止浏览器卡死
+      const logsToSend = newLogs.length > MAX_LOGS_PER_BROADCAST
+        ? newLogs.slice(-MAX_LOGS_PER_BROADCAST)
+        : newLogs;
+      logsMsg = JSON.stringify({ type: 'logs', data: logsToSend });
     }
 
     wss.clients.forEach((client) => {
@@ -64,6 +79,7 @@ function collectStats() {
   return {
     callbackSuccess: getTotalSuccessCount(),
     callbackDropped: getTotalDroppedCount(),
+    callbackRatePerMin: getCallbackRatePerMin(),
     retryQueueLength: getRetryQueueLength(),
     queuePending: taskQueue.pendingCount,
     queueStats: taskQueue.getStats(),

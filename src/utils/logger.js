@@ -7,6 +7,7 @@ const logDir = path.resolve(__dirname, '../../logs');
 
 // Dashboard 日志缓冲区
 const logBuffer = [];
+const pendingLogs = [];
 const MAX_LOG_BUFFER = 500;
 let dashboardMode = false;
 
@@ -52,6 +53,7 @@ logger.enableDashboardMode = function () {
       const msg = chunk.toString().trim();
       if (msg) {
         logBuffer.push(msg);
+        pendingLogs.push(msg);
         if (logBuffer.length > MAX_LOG_BUFFER) {
           logBuffer.shift();
         }
@@ -72,10 +74,17 @@ logger.enableDashboardMode = function () {
 };
 
 /**
- * 获取日志缓冲区（供 Dashboard 读取）
+ * 获取日志缓冲区（供初次连接读取历史）
  */
 logger.getLogBuffer = function () {
   return logBuffer;
+};
+
+/**
+ * 取出待发送的新日志（取后清空）
+ */
+logger.drainLogs = function () {
+  return pendingLogs.splice(0);
 };
 
 module.exports = logger;

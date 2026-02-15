@@ -8,6 +8,17 @@ const pullStats = {
   pullExpired: 0,
 };
 
+// 每分钟拉取次数统计（用于计算速率）
+const pullCountHistory = []; // [{ timestamp: number, count: number }]
+
+function updatePullRate() {
+  const now = Date.now();
+  pullCountHistory.push({ timestamp: now, count: 1 });
+  while (pullCountHistory.length > 0 && now - pullCountHistory[0].timestamp > 120000) {
+    pullCountHistory.shift();
+  }
+}
+
 /**
  * 从上游拉取单个任务
  * GET /api/get/task?phone=xxx
@@ -42,6 +53,7 @@ async function pullSingleTask() {
     }
 
     pullStats.totalPulled++;
+    updatePullRate();
 
     return {
       shop_id: taskData.shop_id,
@@ -63,7 +75,12 @@ async function pullSingleTask() {
  * 获取拉取统计
  */
 function getPullStats() {
-  return { ...pullStats };
+  const now = Date.now();
+  const oneMinAgo = now - 60000;
+  const recentCount = pullCountHistory
+    .filter(item => item.timestamp > oneMinAgo)
+    .reduce((sum, item) => sum + item.count, 0);
+  return { ...pullStats, pullRatePerMin: recentCount };
 }
 
 module.exports = { pullSingleTask, getPullStats };
