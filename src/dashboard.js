@@ -36,13 +36,13 @@ function createDashboard() {
     },
   });
 
-  // ========== 统计面板 - 左列：数据提供方请求统计 ==========
+  // ========== 统计面板 - 左列：数据请求统计 ==========
   const providerBox = blessed.box({
     top: 3,
     left: 0,
     width: '34%',
     height: 10,
-    label: ' 数据提供方请求统计 ',
+    label: ' 数据请求统计 ',
     tags: true,
     border: { type: 'line' },
     style: {
@@ -184,7 +184,7 @@ function createDashboard() {
     const cbSuccess = getTotalSuccessCount();
     const cbDropped = getTotalDroppedCount();
 
-    // 数据提供方请求统计
+    // 数据请求统计
     const endpointTotal = qs.successCount + qs.failureCount + qs.offlineCount;
     const colWidth = 24;
     providerBox.setContent(
@@ -225,10 +225,10 @@ function createDashboard() {
     const col3Width = 24;
     queueBox.setContent(
       `${padLabel('当前队列大小:', tqs.pending, col3Width)}\n` +
-      `${padLabel('活跃任务数:', activeWorkers, col3Width)}\n` +
+      `${padLabel('队列中超时数:', `{red-fg}${ss.queueTimeoutCount}{/red-fg}`, col3Width)}\n` +
+      `${padLabel('活跃工作线程:', activeWorkers, col3Width)}\n` +
       `拉取模式:       ${pullModeText}\n` +
       `${padLabel('拉取时间限制:', formatTime(pullTTL), col3Width)}\n` +
-      `${padLabel('队列处理限制:', formatTime(queueTTL), col3Width)}\n` +
       `${padLabel('工作线程数:', totalWorkerConfig, col3Width)}`
     );
 

@@ -100,10 +100,17 @@ class TaskQueue {
     const before = this.queue.length;
 
     this.queue = this.queue.filter(task => {
-      const expired = (now - task.enqueue_time) > timeoutMs;
+      // 统一使用任务创建时间 created_at 判断是否超时
+      if (!task.created_at) {
+        return true;  // 没有 created_at 的任务保留
+      }
+
+      const createdTime = new Date(task.created_at).getTime();
+      const expired = (now - createdTime) > timeoutMs;
+
       if (expired) {
         this.dedupeSet.delete(this._makeKey(task));
-        logger.info(`任务超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} retry=${task.retry_count}`);
+        logger.info(`任务超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} retry=${task.retry_count}`);
       }
       return !expired;
     });

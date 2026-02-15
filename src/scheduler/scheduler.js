@@ -29,11 +29,13 @@ let statsLastSuccess = 0;
 let pullCount = 0;
 let pullDupCount = 0;
 let querySkipCount = 0;
+let queueTimeoutCount = 0;  // 队列中超时统计
 
 // 上次统计输出时的快照（用于计算增量）
 let lastStatsPullCount = 0;
 let lastStatsPullDupCount = 0;
 let lastStatsQuerySkipCount = 0;
+let lastStatsQueueTimeoutCount = 0;
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -83,25 +85,27 @@ async function queryWorker(workerId) {
 
     if (taskQueue.pendingCount === 0) {
       if (sleeping) break;
-      await sleep(30);
+      await sleep(10);
       continue;
     }
 
     const tasks = taskQueue.dequeue(1);
     if (tasks.length === 0) {
-      await sleep(30);
+      await sleep(10);
       continue;
     }
 
     const task = tasks[0];
 
-    // 检查队列中的任务是否超时（入队超过4分40秒直接丢弃）
-    if (task.enqueue_time) {
-      const age = Date.now() - task.enqueue_time;
-      if (age > config.scheduler.queueTaskTimeout) {
-        logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} good_id=${task.good_id} age=${(age / 1000).toFixed(0)}s`);
+    // 检查队列中的任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
+    if (task.created_at) {
+      const createdTime = new Date(task.created_at).getTime();
+      const age = Date.now() - createdTime;
+      if (age > 290000) {  // 4分50秒 = 290000ms
+        logger.info(`队列任务已超时丢弃: shop_id=${task.shop_id} item_id=${task.item_id} created_at=${task.created_at} age=${(age / 1000).toFixed(0)}s`);
         taskQueue.removeKey(task);
         querySkipCount++;
+        queueTimeoutCount++;  // 队列中超时计数
         continue;
       }
     }
@@ -118,9 +122,9 @@ async function queryWorker(workerId) {
       if (result.success) {
         callbackQueue.push({ task: result.task, data: result.data });
       } else {
-        // 重试退避：根据重试次数递增等待时间（1s, 2s, 3s...最大5s）
+        // 重试退避：根据重试次数递增等待时间（500ms, 1s, 1.5s...最大3s）
         const retryCount = (task.retry_count || 0);
-        task.retry_after = Date.now() + Math.min((retryCount + 1) * 1000, 5000);
+        task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
         taskQueue.requeue([task]);
       }
     } catch (err) {
@@ -138,12 +142,24 @@ async function callbackWorker(workerId) {
   while (!workersStopped) {
     if (callbackQueue.length === 0) {
       if (sleeping && taskQueue.pendingCount === 0) break;
-      await sleep(20);
+      await sleep(10);
       continue;
     }
 
     const item = callbackQueue.shift();
     if (!item) continue;
+
+    // 检查任务是否超时（使用 created_at 判断，超过4分50秒直接丢弃）
+    if (item.task.created_at) {
+      const createdTime = new Date(item.task.created_at).getTime();
+      const age = Date.now() - createdTime;
+      if (age > 290000) {  // 4分50秒 = 290000ms
+        logger.info(`回调任务已超时丢弃: shop_id=${item.task.shop_id} item_id=${item.task.item_id} created_at=${item.task.created_at} age=${(age / 1000).toFixed(0)}s`);
+        taskQueue.removeKey(item.task);
+        queueTimeoutCount++;  // 队列中超时计数
+        continue;
+      }
+    }
 
     try {
       const ok = await callbackSingle(item.task, item.data);
@@ -166,11 +182,12 @@ async function callbackWorker(workerId) {
 }
 
 /**
- * 清理循环：定期清理超时任务
+ * 清理循环：定期清理超时任务（4分50秒）
  */
 function cleanupLoop() {
-  const purged = taskQueue.purgeExpired(config.scheduler.taskTimeout);
+  const purged = taskQueue.purgeExpired(290000);  // 4分50秒 = 290000ms
   if (purged > 0) {
+    queueTimeoutCount += purged;  // 队列中超时计数
     logger.info(`清理超时任务: ${purged} 条`);
   }
 }
@@ -199,14 +216,16 @@ function statsLoop() {
   const deltaPull = pullCount - lastStatsPullCount;
   const deltaDup = pullDupCount - lastStatsPullDupCount;
   const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
+  const deltaTimeout = queueTimeoutCount - lastStatsQueueTimeoutCount;
 
-  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers} cb=${activeCallbackWorkers}`);
+  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers} cb=${activeCallbackWorkers}`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
   lastStatsPullCount = pullCount;
   lastStatsPullDupCount = pullDupCount;
   lastStatsQuerySkipCount = querySkipCount;
+  lastStatsQueueTimeoutCount = queueTimeoutCount;
 }
 
 /**
@@ -330,6 +349,7 @@ function getStats() {
     pullCount,
     pullDupCount,
     querySkipCount,
+    queueTimeoutCount,  // 队列中超时统计
   };
 }
 

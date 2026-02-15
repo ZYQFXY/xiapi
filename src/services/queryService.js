@@ -8,7 +8,7 @@ const RETRY_ERROR_CODES = [
   1100002  // Product is being processed
 ];
 
-// 数据提供方请求统计
+// 数据请求统计
 const queryStats = {
   totalRequests: 0,     // 总请求数（包括重试）
   successCount: 0,      // 查询成功（_success=true 且有 item 数据）
@@ -92,7 +92,7 @@ async function querySingle(task) {
 }
 
 /**
- * 获取数据提供方请求统计
+ * 获取数据请求统计
  */
 function getQueryStats() {
   return { ...queryStats };
