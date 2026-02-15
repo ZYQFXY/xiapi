@@ -14,7 +14,10 @@ app.use('/', routes);
 // 全局未捕获异常处理
 process.on('uncaughtException', (err) => {
   logger.error(`未捕获异常: ${err.message}\n${err.stack}`);
-  process.exit(1);
+  // 仅在致命错误时退出，普通异常记录后继续运行
+  if (err.code === 'ERR_SOCKET_EXHAUSTED' || err.message.includes('out of memory')) {
+    process.exit(1);
+  }
 });
 
 process.on('unhandledRejection', (reason) => {

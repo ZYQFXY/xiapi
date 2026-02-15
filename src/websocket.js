@@ -15,17 +15,34 @@ let lastLogIndex = 0;
 
 const MAX_LOGS_PER_BROADCAST = 50;
 
+const HEARTBEAT_INTERVAL = 30000; // 30秒发一次心跳
+
+function safeSend(ws, data) {
+  try {
+    if (ws.readyState === 1) {
+      ws.send(data);
+    }
+  } catch (err) {
+    // 发送失败，忽略（连接即将关闭）
+  }
+}
+
 function setupWebSocket(server) {
   const wss = new WebSocketServer({ server, path: '/ws' });
 
   wss.on('connection', (ws) => {
+    ws.isAlive = true;
     logger.info('WebSocket 客户端已连接');
+
+    ws.on('pong', () => {
+      ws.isAlive = true;
+    });
 
     // 发送历史日志
     const history = logger.getLogBuffer();
     if (history.length > 0) {
       const recent = history.slice(-MAX_LOGS_PER_BROADCAST);
-      ws.send(JSON.stringify({ type: 'logs', data: recent }));
+      safeSend(ws, JSON.stringify({ type: 'logs', data: recent }));
     }
 
     ws.on('message', (raw) => {
@@ -42,6 +59,26 @@ function setupWebSocket(server) {
     ws.on('close', () => {
       logger.info('WebSocket 客户端已断开');
     });
+
+    ws.on('error', (err) => {
+      logger.warn(`WebSocket 连接错误: ${err.message}`);
+    });
+  });
+
+  // 心跳检测：每30秒 ping 一次，清除无响应的死连接
+  const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+      if (!ws.isAlive) {
+        // 上一轮 ping 没收到 pong，判定为死连接
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch (e) {}
+    });
+  }, HEARTBEAT_INTERVAL);
+
+  wss.on('close', () => {
+    clearInterval(heartbeat);
   });
 
   // 每秒广播统计数据和增量日志
@@ -51,13 +88,18 @@ function setupWebSocket(server) {
       return;
     }
 
-    const stats = collectStats();
-    const statsMsg = JSON.stringify({ type: 'stats', data: stats });
+    let statsMsg;
+    try {
+      const stats = collectStats();
+      statsMsg = JSON.stringify({ type: 'stats', data: stats });
+    } catch (err) {
+      logger.warn(`统计数据收集失败: ${err.message}`);
+      statsMsg = null;
+    }
 
     const newLogs = logger.drainLogs();
     let logsMsg = null;
     if (newLogs.length > 0) {
-      // 日志过多时只保留最新的，防止浏览器卡死
       const logsToSend = newLogs.length > MAX_LOGS_PER_BROADCAST
         ? newLogs.slice(-MAX_LOGS_PER_BROADCAST)
         : newLogs;
@@ -65,10 +107,8 @@ function setupWebSocket(server) {
     }
 
     wss.clients.forEach((client) => {
-      if (client.readyState === 1) {
-        client.send(statsMsg);
-        if (logsMsg) client.send(logsMsg);
-      }
+      if (statsMsg) safeSend(client, statsMsg);
+      if (logsMsg) safeSend(client, logsMsg);
     });
   }, 1000);
 

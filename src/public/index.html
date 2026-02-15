@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>虾皮数据服务控制台 - 2号客户接口1</title>
+<link rel="icon" href="data:,">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1923; color: #e0e0e0; min-height: 100vh; }
@@ -265,11 +266,37 @@ function sendCmd(cmd) {
   }
 }
 
+var reconnectDelay = 3000;
+var maxReconnectDelay = 30000;
+var connecting = false;
+
 function connect() {
-  var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(protocol + '//' + location.host + '/ws');
+  if (connecting) return;
+  connecting = true;
+
+  // 关闭旧连接
+  if (ws) {
+    try {
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.close();
+    } catch (e) {}
+    ws = null;
+  }
+
+  try {
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(protocol + '//' + location.host + '/ws');
+  } catch (e) {
+    connecting = false;
+    setConnected(false);
+    scheduleReconnect();
+    return;
+  }
 
   ws.onopen = function() {
+    connecting = false;
+    reconnectDelay = 3000; // 连接成功后重置退避时间
     setConnected(true);
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -289,12 +316,15 @@ function connect() {
   };
 
   ws.onclose = function() {
+    connecting = false;
     setConnected(false);
     scheduleReconnect();
   };
 
   ws.onerror = function() {
+    connecting = false;
     setConnected(false);
+    // onclose 会在 onerror 之后触发，由 onclose 处理重连
   };
 }
 
@@ -303,7 +333,9 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(function() {
     reconnectTimer = null;
     connect();
-  }, 3000);
+  }, reconnectDelay);
+  // 指数退避：每次失败后延迟翻倍，最大30秒
+  reconnectDelay = Math.min(reconnectDelay * 2, maxReconnectDelay);
 }
 
 connect();
