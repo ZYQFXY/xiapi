@@ -4,6 +4,26 @@ const logger = require('../utils/logger');
 
 // 需要重试的错误码
 const RETRY_ERROR_CODE = 1000000; // Unknown error
+const PROCESSING_ERROR_CODE = 1100002; // Product is being processed
+
+// 数据提供方请求统计
+const queryStats = {
+  totalRequests: 0,
+  successCount: 0,      // _success=true 且 data 包含 item
+  processingCount: 0,   // HTTP 400, code=1100002（商品处理中）
+  failureCount: 0,      // 网络异常或 code=1000000（需重试）
+};
+
+/**
+ * 检查响应是否包含有效的商品数据
+ */
+function hasValidItemData(body) {
+  try {
+    return !!(body && body.response && body.response.data && body.response.data.item);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 查询单个商品详情
@@ -13,6 +33,8 @@ const RETRY_ERROR_CODE = 1000000; // Unknown error
  *   success=false → 未知错误（1000000）或网络异常，需重试
  */
 async function querySingle(task) {
+  queryStats.totalRequests++;
+
   try {
     const res = await tokegeClient.post('/request/shopee/pdp', {
       country: task.country,
@@ -24,6 +46,9 @@ async function querySingle(task) {
     const body = res.data;
 
     if (body && body._success === true) {
+      if (hasValidItemData(body)) {
+        queryStats.successCount++;
+      }
       return { task, success: true, data: body };
     }
 
@@ -39,19 +64,35 @@ async function querySingle(task) {
 
       if (errCode === RETRY_ERROR_CODE) {
         // code 1000000: Unknown error → 重试
+        queryStats.failureCount++;
         logger.warn(`查询失败(需重试): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
         return { task, success: false, data: null };
       }
 
-      // 其他错误码（如 1100002 Product is being processed）→ 不重试，直接回调
+      if (errCode === PROCESSING_ERROR_CODE) {
+        // code 1100002: Product is being processed → 商品处理中
+        queryStats.processingCount++;
+        logger.info(`查询返回(商品处理中): shop_id=${task.shop_id} item_id=${task.item_id}`);
+        return { task, success: true, data: errBody };
+      }
+
+      // 其他错误码 → 不重试，直接回调
       logger.info(`查询返回(${errCode}): shop_id=${task.shop_id} item_id=${task.item_id} msg=${errMsg}`);
       return { task, success: true, data: errBody };
     }
 
     // 网络错误/超时等无响应体 → 重试
+    queryStats.failureCount++;
     logger.warn(`查询网络异常(需重试): shop_id=${task.shop_id} item_id=${task.item_id} err=${err.message}`);
     return { task, success: false, data: null };
   }
+}
+
+/**
+ * 获取数据提供方请求统计
+ */
+function getQueryStats() {
+  return { ...queryStats };
 }
 
 /**
@@ -81,4 +122,4 @@ async function batchQuery(tasks) {
   return { successes, failures };
 }
 
-module.exports = { querySingle, batchQuery };
+module.exports = { querySingle, batchQuery, getQueryStats };

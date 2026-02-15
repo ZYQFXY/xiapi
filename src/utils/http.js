@@ -9,7 +9,7 @@ const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 100 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100 });
 
 /**
- * 上游拉取任务 HTTP 客户端（101.34.226.247）
+ * 上游拉取任务 HTTP 客户端（103.207.68.206:3000）
  */
 const pullClient = axios.create({
   baseURL: config.upstream.pullBaseUrl,
@@ -20,7 +20,7 @@ const pullClient = axios.create({
 });
 
 /**
- * 上游上传任务 HTTP 客户端（118.25.45.42:9000）
+ * 上游上传任务 HTTP 客户端（103.207.68.206:9000）
  */
 const uploadClient = axios.create({
   baseURL: config.upstream.uploadBaseUrl,

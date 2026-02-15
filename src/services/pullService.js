@@ -2,17 +2,22 @@ const { pullClient } = require('../utils/http');
 const config = require('../config');
 const logger = require('../utils/logger');
 
+// 拉取统计
+const pullStats = {
+  totalPulled: 0,
+  pullExpired: 0,
+};
+
 /**
  * 从上游拉取单个任务
- * GET /api/get/newtask?phone=xxx&country=xxx
+ * GET /api/get/task?phone=xxx
  * @returns {Object|null} 转换后的任务对象，无任务返回 null
  */
 async function pullSingleTask() {
   try {
-    const res = await pullClient.get('/api/get/newtask', {
+    const res = await pullClient.get('/api/get/task', {
       params: {
         phone: config.upstream.phone,
-        country: config.upstream.country,
       },
     });
 
@@ -30,10 +35,13 @@ async function pullSingleTask() {
     if (taskData.created_at) {
       const createdTime = new Date(taskData.created_at).getTime();
       if (Date.now() - createdTime > config.scheduler.pullTaskTimeout) {
+        pullStats.pullExpired++;
         logger.info(`拉取任务已超时丢弃: shop_id=${taskData.shop_id} good_id=${taskData.good_id} created_at=${taskData.created_at}`);
         return null;
       }
     }
+
+    pullStats.totalPulled++;
 
     return {
       shop_id: taskData.shop_id,
@@ -50,4 +58,11 @@ async function pullSingleTask() {
   }
 }
 
-module.exports = { pullSingleTask };
+/**
+ * 获取拉取统计
+ */
+function getPullStats() {
+  return { ...pullStats };
+}
+
+module.exports = { pullSingleTask, getPullStats };

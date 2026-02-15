@@ -12,23 +12,26 @@ const retryQueue = [];
 // 回调成功总计数
 let totalSuccessCount = 0;
 
+// 废弃任务总计数（重试超限丢弃）
+let totalDroppedCount = 0;
+
 /**
  * 回调单个结果
- * POST /task/api/complete/upload
+ * POST /task/api/json/upload
  * @param {Object} task - 任务对象
  * @param {Object} data - tokege 返回的完整数据
  * @returns {boolean} 是否成功
  */
 async function callbackSingle(task, data) {
   try {
-    await uploadClient.post('/task/api/complete/upload', {
+    await uploadClient.post('/task/api/json/upload', {
       type: task.type,
       task: {
         shop_id: task.shop_id,
         good_id: task.good_id,
         country: task.country,
         trace_id: task.trace_id,
-        content: JSON.stringify(data && data.response ? data.response : data),
+        content: data && data.response ? data.response : data,
         phone: config.upstream.phone,
       },
     }, {
@@ -117,6 +120,7 @@ async function processRetryQueue() {
           succeeded++;
         } else if (item.retryCount >= maxRetry) {
           taskQueue.removeKey(item.task);
+          totalDroppedCount++;
           logger.error(`回调重试超限丢弃: shop_id=${item.task.shop_id} good_id=${item.task.good_id} 已重试${item.retryCount}次`);
           dropped++;
         } else {
@@ -152,6 +156,13 @@ function getTotalSuccessCount() {
   return totalSuccessCount;
 }
 
+/**
+ * 获取废弃任务总数
+ */
+function getTotalDroppedCount() {
+  return totalDroppedCount;
+}
+
 module.exports = {
   callbackSingle,
   addToCallbackQueue,
@@ -161,4 +172,5 @@ module.exports = {
   getCallbackQueueLength,
   getRetryQueueLength,
   getTotalSuccessCount,
+  getTotalDroppedCount,
 };

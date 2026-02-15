@@ -14,7 +14,8 @@ let cleanupTimer = null;
 let callbackRetryTimer = null;
 let statsTimer = null;
 let sleeping = false;
-let workersStopped = false;
+let workersStopped = true;
+let pullingPaused = false;
 let activePullWorkers = 0;
 let activeQueryWorkers = 0;
 let activeCallbackWorkers = 0;
@@ -22,12 +23,17 @@ let activeCallbackWorkers = 0;
 // 回调队列（scheduler 内部管理）
 const callbackQueue = [];
 
-// 吞吐量统计
+// 吞吐量统计（累计值）
 let statsLastTime = Date.now();
 let statsLastSuccess = 0;
 let pullCount = 0;
 let pullDupCount = 0;
 let querySkipCount = 0;
+
+// 上次统计输出时的快照（用于计算增量）
+let lastStatsPullCount = 0;
+let lastStatsPullDupCount = 0;
+let lastStatsQuerySkipCount = 0;
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -47,7 +53,7 @@ function enterSleepMode() {
  */
 async function pullWorker(workerId) {
   activePullWorkers++;
-  while (!workersStopped && !sleeping) {
+  while (!workersStopped && !sleeping && !pullingPaused) {
     try {
       const task = await pullSingleTask();
       if (task) {
@@ -190,13 +196,17 @@ function statsLoop() {
   const delta = currentSuccess - statsLastSuccess;
   const rate = (delta / elapsed * 60).toFixed(1);
 
-  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount} 去重: ${pullDupCount} 超时丢弃: ${querySkipCount} | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers} cb=${activeCallbackWorkers}`);
+  const deltaPull = pullCount - lastStatsPullCount;
+  const deltaDup = pullDupCount - lastStatsPullDupCount;
+  const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
+
+  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers} cb=${activeCallbackWorkers}`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
-  pullCount = 0;
-  pullDupCount = 0;
-  querySkipCount = 0;
+  lastStatsPullCount = pullCount;
+  lastStatsPullDupCount = pullDupCount;
+  lastStatsQuerySkipCount = querySkipCount;
 }
 
 /**
@@ -207,35 +217,44 @@ function start() {
   const queryWorkerCount = config.scheduler.queryConcurrency;
   const callbackWorkerCount = config.scheduler.callbackConcurrency;
 
+  workersStopped = false;
+  sleeping = false;
+  pullingPaused = false;
+
   logger.info('调度器启动');
   logger.info(`配置: pull_worker=${pullWorkerCount} query_worker=${queryWorkerCount} callback_worker=${callbackWorkerCount} 休眠阈值=${config.scheduler.callbackSuccessLimit}`);
 
-  workersStopped = false;
-
-  // 启动拉取工作线程池
-  logger.info(`启动 ${pullWorkerCount} 个拉取工作线程`);
-  for (let i = 0; i < pullWorkerCount; i++) {
-    pullWorker(i);
+  // 启动拉取工作线程池（补足差额）
+  const pullNeeded = pullWorkerCount - activePullWorkers;
+  if (pullNeeded > 0) {
+    logger.info(`启动 ${pullNeeded} 个拉取工作线程`);
+    for (let i = 0; i < pullNeeded; i++) {
+      pullWorker(i);
+    }
   }
 
-  // 启动查询工作线程池
-  logger.info(`启动 ${queryWorkerCount} 个查询工作线程`);
-  for (let i = 0; i < queryWorkerCount; i++) {
-    queryWorker(i);
+  // 启动查询工作线程池（补足差额）
+  const queryNeeded = queryWorkerCount - activeQueryWorkers;
+  if (queryNeeded > 0) {
+    logger.info(`启动 ${queryNeeded} 个查询工作线程`);
+    for (let i = 0; i < queryNeeded; i++) {
+      queryWorker(i);
+    }
   }
 
-  // 启动回调工作线程池
-  logger.info(`启动 ${callbackWorkerCount} 个回调工作线程`);
-  for (let i = 0; i < callbackWorkerCount; i++) {
-    callbackWorker(i);
+  // 启动回调工作线程池（补足差额）
+  const callbackNeeded = callbackWorkerCount - activeCallbackWorkers;
+  if (callbackNeeded > 0) {
+    logger.info(`启动 ${callbackNeeded} 个回调工作线程`);
+    for (let i = 0; i < callbackNeeded; i++) {
+      callbackWorker(i);
+    }
   }
 
-  // 启动清理、重试定时器
-  cleanupTimer = setInterval(cleanupLoop, config.scheduler.cleanupInterval);
-  callbackRetryTimer = setInterval(callbackRetryLoop, config.scheduler.callbackRetryInterval);
-
-  // 启动统计日志
-  statsTimer = setInterval(statsLoop, 10000);
+  // 启动清理、重试定时器（如果未在运行）
+  if (!cleanupTimer) cleanupTimer = setInterval(cleanupLoop, config.scheduler.cleanupInterval);
+  if (!callbackRetryTimer) callbackRetryTimer = setInterval(callbackRetryLoop, config.scheduler.callbackRetryInterval);
+  if (!statsTimer) statsTimer = setInterval(statsLoop, 10000);
 }
 
 /**
@@ -250,7 +269,75 @@ function stop() {
   callbackRetryTimer = null;
   statsTimer = null;
   sleeping = false;
+  pullingPaused = false;
   logger.info('调度器已停止');
 }
 
-module.exports = { start, stop };
+/**
+ * 启动/恢复拉取
+ */
+function startPulling() {
+  if (workersStopped) return;
+
+  pullingPaused = false;
+  sleeping = false;
+
+  // 补足已退出的工作线程
+  const pullNeeded = config.scheduler.pullSize - activePullWorkers;
+  if (pullNeeded > 0) {
+    for (let i = 0; i < pullNeeded; i++) {
+      pullWorker(i);
+    }
+  }
+
+  const queryNeeded = config.scheduler.queryConcurrency - activeQueryWorkers;
+  if (queryNeeded > 0) {
+    for (let i = 0; i < queryNeeded; i++) {
+      queryWorker(i);
+    }
+  }
+
+  const callbackNeeded = config.scheduler.callbackConcurrency - activeCallbackWorkers;
+  if (callbackNeeded > 0) {
+    for (let i = 0; i < callbackNeeded; i++) {
+      callbackWorker(i);
+    }
+  }
+
+  logger.info('拉取已启动');
+}
+
+/**
+ * 暂停拉取
+ */
+function stopPulling() {
+  pullingPaused = true;
+  logger.info('拉取已暂停');
+}
+
+/**
+ * 获取调度器状态
+ */
+function getStats() {
+  return {
+    sleeping,
+    workersStopped,
+    pullingPaused,
+    activePullWorkers,
+    activeQueryWorkers,
+    activeCallbackWorkers,
+    callbackQueueLength: callbackQueue.length,
+    pullCount,
+    pullDupCount,
+    querySkipCount,
+  };
+}
+
+/**
+ * 调度器是否在运行
+ */
+function isRunning() {
+  return !workersStopped;
+}
+
+module.exports = { start, stop, startPulling, stopPulling, getStats, isRunning };

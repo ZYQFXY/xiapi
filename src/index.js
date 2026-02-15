@@ -18,10 +18,22 @@ process.on('unhandledRejection', (reason) => {
   logger.error(`未处理Promise拒绝: ${reason}`);
 });
 
+// 检查是否使用控制台面板模式
+const useDashboard = process.argv.includes('--dashboard') || process.argv.includes('-d');
+
 // 启动服务
 app.listen(config.port, () => {
   logger.info(`xiapi 服务启动，端口: ${config.port}`);
-  scheduler.start();
+
+  if (useDashboard) {
+    // Dashboard 模式：将日志重定向到缓冲区，启动控制台面板，等待用户手动启动任务
+    logger.enableDashboardMode();
+    const { createDashboard } = require('./dashboard');
+    createDashboard();
+  } else {
+    // 普通模式：自动启动调度器
+    scheduler.start();
+  }
 });
 
 // 优雅退出
