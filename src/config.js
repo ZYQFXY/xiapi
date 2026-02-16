@@ -24,7 +24,7 @@ module.exports = {
     batchSize: parseInt(process.env.BATCH_SIZE, 10) || 200,
     batchCheckInterval: parseInt(process.env.BATCH_CHECK_INTERVAL, 10) || 2000,
     taskTimeout: parseInt(process.env.TASK_TIMEOUT, 10) || 1440000,
-    pullTaskTimeout: parseInt(process.env.PULL_TASK_TIMEOUT, 10) || 280000,
+    pullTaskTimeout: parseInt(process.env.PULL_TASK_TIMEOUT, 10) || 180000,
     queueTaskTimeout: parseInt(process.env.QUEUE_TASK_TIMEOUT, 10) || 280000,
     cleanupInterval: parseInt(process.env.CLEANUP_INTERVAL, 10) || 30000,
     queryConcurrency: parseInt(process.env.QUERY_CONCURRENCY, 10) || 50,

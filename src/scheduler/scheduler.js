@@ -24,8 +24,8 @@ let activeCallbackWorkers = 0;
 let hardStopped = false;            // 超时丢弃>20%紧急停止，不可自动恢复
 
 // 队列背压阈值
-const QUEUE_HIGH_WATER = 20000;
-const QUEUE_LOW_WATER = 2000;
+const QUEUE_HIGH_WATER = 1500;
+const QUEUE_LOW_WATER = 500;
 
 // ======== 外部 API 健康检测 & 自动降级 ========
 const HEALTH_WINDOW_MS = 60000;       // 60 秒统计窗口
@@ -152,6 +152,7 @@ let querySkipCount = 0;
 let queueTimeoutCount = 0;  // 队列中超时统计
 let creditExhaustedCount = 0;  // 额度耗尽触发次数
 let callbackTimeoutDiscards = 0;  // 回调阶段超时丢弃计数
+let queryStaleCount = 0;          // 查询阶段过期丢弃（不计入超时丢弃率）
 let discardDegradeTriggered = false;  // 丢弃率降级已触发
 let discardCircuitTriggered = false;  // 丢弃率熔断已触发
 
@@ -494,6 +495,19 @@ async function queryWorker(workerId) {
   activeQueryWorkers--;
 }
 
+/** 检查任务是否查询前过期（>4分钟），不计入超时丢弃率 */
+function isTaskStale(task) {
+  if (!task.created_at) return false;
+  const age = Date.now() - new Date(task.created_at).getTime();
+  if (age > 240000) {
+    logger.info(`查询前过期丢弃: shop_id=${task.shop_id} item_id=${task.item_id} age=${(age / 1000).toFixed(0)}s`);
+    taskQueue.removeKey(task);
+    queryStaleCount++;
+    return true;
+  }
+  return false;
+}
+
 /** 检查任务是否队列中超时，超时返回 true */
 function isTaskExpired(task) {
   if (!task.created_at) return false;
@@ -519,7 +533,7 @@ async function queryProcessBatch() {
   }
 
   const promises = tasks.map(async (task) => {
-    if (isTaskExpired(task)) return null;
+    if (isTaskStale(task)) return null;
 
     // 二次拦截：任务已被处理过（回调成功/丢弃），跳过查询
     if (taskQueue.isProcessed(task)) {
@@ -588,7 +602,7 @@ async function queryProcessOne() {
   }
 
   for (const task of tasks) {
-    if (isTaskExpired(task)) continue;
+    if (isTaskStale(task)) continue;
 
     // 二次拦截：任务已被处理过（回调成功/丢弃），跳过查询
     if (taskQueue.isProcessed(task)) {
@@ -970,6 +984,7 @@ function getStats() {
     pullCount,
     pullDupCount,
     querySkipCount,
+    queryStaleCount,
     queueTimeoutCount,
     callbackTimeoutDiscards,
     totalDiscards,
