@@ -2,10 +2,14 @@ const { tokegeClient } = require('../utils/http');
 const config = require('../config');
 const logger = require('../utils/logger');
 
-// 需要重试的错误码
-const RETRY_ERROR_CODES = [
-  1000000, // Unknown error
+// 需要重试的错误码（视为正常，API 在工作）
+const RETRY_HEALTHY_CODES = [
   1100002  // Product is being processed
+];
+
+// 需要重试的错误码（视为异常，计入健康检测）
+const RETRY_UNHEALTHY_CODES = [
+  1000000, // Unknown error — API 端异常
 ];
 
 // 额度耗尽错误码 → 不重试，不回调，不算下架
@@ -49,9 +53,11 @@ function hasValidItemData(body) {
 /**
  * 查询单个商品详情
  * @param {Object} task - 任务对象
- * @returns {Object} { task, success, data }
+ * @returns {Object} { task, success, data, creditExhausted, processing }
  *   success=true  → 查询成功，需回调
- *   success=false → 未知错误（1000000）、商品处理中（1100002）或网络异常，需重试
+ *   success=false → 未知错误（1000000）、商品处理中（1100002），需重试
+ *   processing=true → 商品处理中（1100002），健康检测视为正常
+ * @throws {Error} 网络错误/超时等无响应体时抛出，由调用方处理健康检测
  */
 async function querySingle(task) {
   queryStats.totalRequests++;
@@ -85,16 +91,19 @@ async function querySingle(task) {
       const errCode = errBody.error && errBody.error.code;
       const errMsg = errBody.error && errBody.error.message;
 
-      // 检查是否为需要重试的错误码
-      if (RETRY_ERROR_CODES.includes(errCode)) {
+      // 商品处理中 → 正常返回，健康检测视为正常
+      if (RETRY_HEALTHY_CODES.includes(errCode)) {
         queryStats.failureCount++;
-        if (errCode === 1100002) {
-          queryStats.processingCount++;
-          logger.warn(`查询失败(商品处理中，需重试): shop_id=${task.shop_id} item_id=${task.item_id}`);
-        } else {
-          logger.warn(`查询失败(需重试): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
-        }
-        return { task, success: false, data: null };
+        queryStats.processingCount++;
+        logger.warn(`查询失败(商品处理中，需重试): shop_id=${task.shop_id} item_id=${task.item_id}`);
+        return { task, success: false, data: null, processing: true };
+      }
+
+      // Unknown error 等 → 抛出，健康检测视为异常，scheduler 负责重试
+      if (RETRY_UNHEALTHY_CODES.includes(errCode)) {
+        queryStats.failureCount++;
+        logger.warn(`查询失败(API异常，需重试): shop_id=${task.shop_id} item_id=${task.item_id} code=${errCode} msg=${errMsg}`);
+        throw err;
       }
 
       // 检查是否为额度耗尽
@@ -110,10 +119,9 @@ async function querySingle(task) {
       return { task, success: true, data: errBody };
     }
 
-    // 网络错误/超时等无响应体 → 重试
+    // 网络错误/超时等无响应体 → 抛出，由 scheduler 处理健康检测
     queryStats.failureCount++;
-    logger.warn(`查询网络异常(需重试): shop_id=${task.shop_id} item_id=${task.item_id} err=${err.message}`);
-    return { task, success: false, data: null };
+    throw err;
   }
 }
 

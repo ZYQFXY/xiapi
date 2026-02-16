@@ -363,6 +363,7 @@ async function queryProcessBatch() {
 
     try {
       const result = await querySingle(task);
+      // API 有响应（包括业务错误），视为健康
       recordSample(queryHealth, false, '查询');
       if (result.creditExhausted) {
         return { type: 'creditExhausted', task };
@@ -377,8 +378,10 @@ async function queryProcessBatch() {
         return { type: 'retry', task };
       }
     } catch (err) {
+      // 网络错误/超时 → 喂给健康检测
       logTask('query', false, task.shop_id, task.item_id);
       recordSample(queryHealth, isUpstreamError(err), '查询');
+      logger.warn(`查询网络异常: shop_id=${task.shop_id} item_id=${task.item_id} err=${err.message}`);
       return { type: 'retry', task };
     }
   });
@@ -420,6 +423,7 @@ async function queryProcessOne() {
 
     try {
       const result = await querySingle(task);
+      // API 有响应（包括业务错误），视为健康
       recordSample(queryHealth, false, '查询');
       if (result.creditExhausted) {
         taskQueue.removeKey(task);
@@ -440,8 +444,10 @@ async function queryProcessOne() {
         taskQueue.requeue([task]);
       }
     } catch (err) {
+      // 网络错误/超时 → 喂给健康检测
       logTask('query', false, task.shop_id, task.item_id);
       recordSample(queryHealth, isUpstreamError(err), '查询');
+      logger.warn(`查询网络异常: shop_id=${task.shop_id} item_id=${task.item_id} err=${err.message}`);
       taskQueue.requeue([task]);
     }
   }
