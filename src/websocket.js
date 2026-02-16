@@ -51,7 +51,7 @@ async function fetchCurnum() {
 
 function startCurnumPolling() {
   fetchCurnum();
-  curnumTimer = setInterval(fetchCurnum, 10000);
+  curnumTimer = setInterval(fetchCurnum, 5000);
 }
 
 startCurnumPolling();
@@ -104,6 +104,14 @@ function setupWebSocket(server) {
     // 发送任务日志历史
     const taskHistory = scheduler.getTaskLogHistory();
     safeSend(ws, JSON.stringify({ type: 'taskLogs', data: taskHistory }));
+
+    // 客户端刚连接，立即刷新 curnum 和余额并推送最新统计
+    Promise.all([fetchCurnum(), fetchCredits()]).then(() => {
+      try {
+        const stats = collectStats();
+        safeSend(ws, JSON.stringify({ type: 'stats', data: stats }));
+      } catch (err) {}
+    });
 
     ws.on('message', (raw) => {
       try {
