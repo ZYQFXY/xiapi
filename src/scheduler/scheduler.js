@@ -26,11 +26,10 @@ const QUEUE_HIGH_WATER = 20000;
 const QUEUE_LOW_WATER = 2000;
 
 // ======== 外部 API 健康检测 & 自动降级 ========
-// 滑动窗口统计：最近 WINDOW_SIZE 秒内的成功/超时次数
-const HEALTH_WINDOW_MS = 30000;       // 30 秒统计窗口
-const DEGRADE_TIMEOUT_RATE = 0.7;     // 超时率 ≥ 70% 触发降级
-const RECOVER_TIMEOUT_RATE = 0.3;     // 超时率 < 30% 恢复正常
-const CIRCUIT_BREAK_THRESHOLD = 100;  // 连续超时 ≥ 100 次触发熔断暂停
+const HEALTH_WINDOW_MS = 60000;       // 60 秒统计窗口
+const DEGRADE_TIMEOUT_RATE = 0.85;    // 超时率 ≥ 85% 触发降级
+const RECOVER_TIMEOUT_RATE = 0.5;     // 超时率 < 50% 恢复正常
+const CIRCUIT_BREAK_THRESHOLD = 500;  // 连续超时 ≥ 500 次触发熔断暂停
 const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断初始暂停 10 秒
 const CIRCUIT_BREAK_MAX_PAUSE_MS = 60000; // 熔断最大暂停 60 秒
 const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
@@ -38,14 +37,16 @@ const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
 // 查询服务健康状态
 const queryHealth = {
   samples: [],          // { ts, timeout: bool }
+  timeoutCount: 0,      // 窗口内超时计数（运行时维护，避免 filter）
   consecutiveTimeouts: 0,
-  degraded: false,      // true = 降级模式（串行），false = 正常模式（批量并发）
-  circuitPause: CIRCUIT_BREAK_PAUSE_MS, // 当前熔断暂停时长（递增）
+  degraded: false,
+  circuitPause: CIRCUIT_BREAK_PAUSE_MS,
 };
 
 // 回调服务健康状态
 const callbackHealth = {
   samples: [],
+  timeoutCount: 0,
   consecutiveTimeouts: 0,
   degraded: false,
   circuitPause: CIRCUIT_BREAK_PAUSE_MS,
@@ -53,14 +54,17 @@ const callbackHealth = {
 
 /**
  * 记录一次请求结果并更新健康状态
+ * 使用 timeoutCount 计数器代替每次 filter，O(1) 开销
  */
 function recordSample(health, isTimeout, label) {
   const now = Date.now();
   health.samples.push({ ts: now, timeout: isTimeout });
+  if (isTimeout) health.timeoutCount++;
 
-  // 清理过期样本
+  // 清理过期样本，同步减少 timeoutCount
   const cutoff = now - HEALTH_WINDOW_MS;
   while (health.samples.length > 0 && health.samples[0].ts < cutoff) {
+    if (health.samples[0].timeout) health.timeoutCount--;
     health.samples.shift();
   }
 
@@ -71,27 +75,28 @@ function recordSample(health, isTimeout, label) {
     health.consecutiveTimeouts = 0;
   }
 
-  // 计算窗口内超时率
+  // 计算窗口内超时率（采样检查，每 20 次检查一次减少开销）
   const total = health.samples.length;
-  if (total < 5) return; // 样本太少不做判断
+  if (total < 200) return;
+  if (total % 20 !== 0 && !isTimeout) return; // 非超时时降低检查频率
 
-  const timeoutCount = health.samples.filter(s => s.timeout).length;
-  const timeoutRate = timeoutCount / total;
+  const timeoutRate = health.timeoutCount / total;
 
   // 状态切换
   if (!health.degraded && timeoutRate >= DEGRADE_TIMEOUT_RATE) {
     health.degraded = true;
-    logger.warn(`[降级] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，切换为串行模式`);
+    logger.warn(`[降级] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${health.timeoutCount}/${total})，切换为串行模式`);
   } else if (health.degraded && timeoutRate < RECOVER_TIMEOUT_RATE) {
     health.degraded = false;
-    health.circuitPause = CIRCUIT_BREAK_PAUSE_MS; // 恢复正常，重置熔断暂停时长
-    logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，恢复批量并发模式`);
+    health.circuitPause = CIRCUIT_BREAK_PAUSE_MS;
+    logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${health.timeoutCount}/${total})，恢复批量并发模式`);
   }
 }
 
 // 拉取服务健康状态（与 queryHealth/callbackHealth 统一体系）
 const pullHealth = {
   samples: [],
+  timeoutCount: 0,
   consecutiveTimeouts: 0,
   degraded: false,
   circuitPause: CIRCUIT_BREAK_PAUSE_MS,
