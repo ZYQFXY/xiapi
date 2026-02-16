@@ -125,8 +125,27 @@ class TaskQueue {
    * @returns {number} 清除的任务数
    */
   purgeExpired(timeoutMs) {
-    // 不再使用基于时间的超时清理，由查询和回调阶段的实时检查处理
-    return 0;
+    const now = Date.now();
+    let purged = 0;
+    const remaining = [];
+
+    for (const task of this.queue) {
+      if (task.created_at) {
+        const age = now - new Date(task.created_at).getTime();
+        if (age > timeoutMs) {
+          const key = this._makeKey(task);
+          this.dedupeSet.delete(key);
+          this._addProcessedKey(key);
+          purged++;
+          continue;
+        }
+      }
+      remaining.push(task);
+    }
+
+    this.queue = remaining;
+    this.stats.totalExpired += purged;
+    return purged;
   }
 
   /**

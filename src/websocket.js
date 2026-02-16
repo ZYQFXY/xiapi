@@ -58,12 +58,16 @@ startCurnumPolling();
 
 // ======== tokege 余额轮询 ========
 let tokegeCredits = null;
+let tokegeInitialCredits = null;
 
 async function fetchCredits() {
   try {
     const res = await tokegeClient.get('/tokens/credits', { timeout: 10000 });
     if (res.data && res.data._success && Array.isArray(res.data.credits) && res.data.credits.length > 0) {
       tokegeCredits = Math.abs(res.data.credits[0].credit);
+      if (tokegeInitialCredits === null) {
+        tokegeInitialCredits = tokegeCredits;
+      }
     }
   } catch (err) {
     // 轮询失败静默忽略
@@ -73,9 +77,11 @@ async function fetchCredits() {
 fetchCredits();
 setInterval(fetchCredits, 30000);
 
+const MAX_BUFFERED = 64 * 1024; // 64KB，超过则跳过推送避免堆积
+
 function safeSend(ws, data) {
   try {
-    if (ws.readyState === 1) {
+    if (ws.readyState === 1 && ws.bufferedAmount < MAX_BUFFERED) {
       ws.send(data);
     }
   } catch (err) {
@@ -206,6 +212,7 @@ function collectStats() {
     schedulerRunning: scheduler.isRunning(),
     curnumData: { ...curnumData },
     tokegeCredits,
+    tokegeCreditsConsumed: (tokegeInitialCredits !== null && tokegeCredits !== null) ? tokegeInitialCredits - tokegeCredits : 0,
   };
 }
 

@@ -128,6 +128,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <div class="metric-card purple">
     <div class="label">API 余额</div>
     <div class="value" id="m-credits">--</div>
+    <div class="sub-value">本次消耗: <span id="m-credits-consumed">0</span></div>
   </div>
 </div>
 
@@ -250,7 +251,7 @@ function setConnected(connected) {
 function updateStats(data) {
   $('m-callback-success').textContent = data.callbackSuccess || 0;
   $('m-queue-length').textContent = data.queuePending || 0;
-  $('m-query-success').textContent = (data.queryStats && data.queryStats.successCount) || 0;
+  $('m-query-success').textContent = (data.queryStats ? (data.queryStats.successCount || 0) + (data.queryStats.offlineCount || 0) : 0);
   $('m-dropped').textContent = data.callbackDropped || 0;
 
   if (data.curnumData) {
@@ -260,11 +261,12 @@ function updateStats(data) {
 
   if (data.tokegeCredits !== null && data.tokegeCredits !== undefined) {
     $('m-credits').textContent = data.tokegeCredits.toLocaleString();
+    $('m-credits-consumed').textContent = (data.tokegeCreditsConsumed || 0).toLocaleString();
   }
 
   if (data.queryStats) {
     $('s-total-requests').textContent = data.queryStats.totalRequests || 0;
-    $('s-query-success').textContent = data.queryStats.successCount || 0;
+    $('s-query-success').textContent = (data.queryStats.successCount || 0) + (data.queryStats.offlineCount || 0);
     $('s-query-failure').textContent = data.queryStats.failureCount || 0;
     $('s-offline').textContent = data.queryStats.offlineCount || 0;
     $('s-processing').textContent = data.queryStats.processingCount || 0;
@@ -298,12 +300,18 @@ function updateStats(data) {
   }
 
   var statusEl = $('scheduler-status');
-  if (data.schedulerStats && data.schedulerStats.creditExhausted) {
+  if (data.schedulerStats && data.schedulerStats.hardStopped) {
+    statusEl.className = 'scheduler-status stopped';
+    statusEl.textContent = '紧急停止';
+  } else if (data.schedulerStats && data.schedulerStats.creditExhausted) {
     statusEl.className = 'scheduler-status credit-exhausted';
     statusEl.textContent = '额度耗尽';
   } else if (data.schedulerStats && data.schedulerStats.autoPaused) {
     statusEl.className = 'scheduler-status sleeping';
     statusEl.textContent = '背压暂停';
+  } else if (data.schedulerStats && data.schedulerStats.pullingPaused) {
+    statusEl.className = 'scheduler-status sleeping';
+    statusEl.textContent = '拉取已暂停';
   } else if (data.schedulerRunning) {
     statusEl.className = 'scheduler-status running';
     statusEl.textContent = '运行中';
@@ -314,8 +322,9 @@ function updateStats(data) {
 
   $('btn-start').disabled = data.schedulerRunning;
   $('btn-stop').disabled = !data.schedulerRunning;
-  $('btn-pull-start').disabled = !data.schedulerRunning || (data.schedulerStats && !data.schedulerStats.pullingPaused && !data.schedulerStats.autoPaused);
-  $('btn-pull-stop').disabled = !data.schedulerRunning || (data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.autoPaused));
+  var isPaused = data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.autoPaused || data.schedulerStats.hardStopped);
+  $('btn-pull-start').disabled = !data.schedulerRunning || !isPaused;
+  $('btn-pull-stop').disabled = !data.schedulerRunning || !!isPaused;
 
   // 系统状态栏
   if (data.schedulerStats) {

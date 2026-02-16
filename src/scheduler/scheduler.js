@@ -7,6 +7,7 @@ const {
   callbackSingle,
   getTotalSuccessCount,
   getRetryQueueLength,
+  getTotalDroppedCount,
   processRetryQueue,
 } = require('../services/callbackService');
 
@@ -20,6 +21,7 @@ let creditExhausted = false; // API额度耗尽自动暂停
 let activePullWorkers = 0;
 let activeQueryWorkers = 0;
 let activeCallbackWorkers = 0;
+let hardStopped = false;            // 超时丢弃>20%紧急停止，不可自动恢复
 
 // 队列背压阈值
 const QUEUE_HIGH_WATER = 20000;
@@ -34,10 +36,17 @@ const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断初始暂停 10 秒
 const CIRCUIT_BREAK_MAX_PAUSE_MS = 60000; // 熔断最大暂停 60 秒
 const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
 
-// 查询服务健康状态
+// ======== 超时丢弃率 → 联动降级 / 熔断 / 紧急停止 ========
+const DISCARD_DEGRADE_RATE = 0.10;     // ≥10% → 降级拉取和查询
+const DISCARD_CIRCUIT_RATE = 0.15;     // ≥15% → 熔断拉取和查询
+const DISCARD_HARD_STOP_RATE = 0.20;   // ≥20% → 紧急停止，不可自动恢复
+const DISCARD_CHECK_MIN_TOTAL = 100;   // 拉取总数未达此值时不检查丢弃率
+
+// 查询服务健康状态（按秒聚合桶，避免高 QPS 下 O(n) shift）
 const queryHealth = {
-  samples: [],          // { ts, timeout: bool }
-  timeoutCount: 0,      // 窗口内超时计数（运行时维护，避免 filter）
+  buckets: new Map(),       // secondTimestamp -> { total, timeouts }
+  windowTotal: 0,           // 窗口内总请求数
+  windowTimeouts: 0,        // 窗口内超时数
   consecutiveTimeouts: 0,
   degraded: false,
   circuitPause: CIRCUIT_BREAK_PAUSE_MS,
@@ -45,8 +54,9 @@ const queryHealth = {
 
 // 回调服务健康状态
 const callbackHealth = {
-  samples: [],
-  timeoutCount: 0,
+  buckets: new Map(),
+  windowTotal: 0,
+  windowTimeouts: 0,
   consecutiveTimeouts: 0,
   degraded: false,
   circuitPause: CIRCUIT_BREAK_PAUSE_MS,
@@ -54,49 +64,61 @@ const callbackHealth = {
 
 /**
  * 记录一次请求结果并更新健康状态
- * 使用 timeoutCount 计数器代替每次 filter，O(1) 开销
+ * 使用按秒聚合桶代替逐条 push/shift，O(1) 写入
  */
 function recordSample(health, isTimeout, label) {
-  const now = Date.now();
-  health.samples.push({ ts: now, timeout: isTimeout });
-  if (isTimeout) health.timeoutCount++;
+  const sec = Math.floor(Date.now() / 1000);
 
-  // 清理过期样本，同步减少 timeoutCount
-  const cutoff = now - HEALTH_WINDOW_MS;
-  while (health.samples.length > 0 && health.samples[0].ts < cutoff) {
-    if (health.samples[0].timeout) health.timeoutCount--;
-    health.samples.shift();
+  // 写入当前秒桶
+  let bucket = health.buckets.get(sec);
+  if (!bucket) {
+    bucket = { total: 0, timeouts: 0 };
+    health.buckets.set(sec, bucket);
   }
-
-  // 更新连续超时计数
+  bucket.total++;
+  health.windowTotal++;
   if (isTimeout) {
+    bucket.timeouts++;
+    health.windowTimeouts++;
     health.consecutiveTimeouts++;
   } else {
     health.consecutiveTimeouts = 0;
   }
 
-  // 计算窗口内超时率（采样检查，每 10 次检查一次减少开销）
-  const total = health.samples.length;
-  if (total < 100) return;
-  if (total % 10 !== 0 && !isTimeout) return; // 非超时时降低检查频率
+  // 清理过期桶（60 秒窗口）
+  const cutoff = sec - 60;
+  for (const [s, b] of health.buckets) {
+    if (s <= cutoff) {
+      health.windowTotal -= b.total;
+      health.windowTimeouts -= b.timeouts;
+      health.buckets.delete(s);
+    } else {
+      break; // Map 按插入顺序遍历，可提前退出
+    }
+  }
 
-  const timeoutRate = health.timeoutCount / total;
+  // 采样检查超时率（每 10 次检查一次减少开销）
+  if (health.windowTotal < 100) return;
+  if (health.windowTotal % 10 !== 0 && !isTimeout) return;
+
+  const timeoutRate = health.windowTimeouts / health.windowTotal;
 
   // 状态切换
   if (!health.degraded && timeoutRate >= DEGRADE_TIMEOUT_RATE) {
     health.degraded = true;
-    logger.warn(`[降级] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${health.timeoutCount}/${total})，切换为串行模式`);
+    logger.warn(`[降级] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${health.windowTimeouts}/${health.windowTotal})，切换为串行模式`);
   } else if (health.degraded && timeoutRate < RECOVER_TIMEOUT_RATE) {
     health.degraded = false;
     health.circuitPause = CIRCUIT_BREAK_PAUSE_MS;
-    logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${health.timeoutCount}/${total})，恢复批量并发模式`);
+    logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${health.windowTimeouts}/${health.windowTotal})，恢复批量并发模式`);
   }
 }
 
 // 拉取服务健康状态（与 queryHealth/callbackHealth 统一体系）
 const pullHealth = {
-  samples: [],
-  timeoutCount: 0,
+  buckets: new Map(),
+  windowTotal: 0,
+  windowTimeouts: 0,
   consecutiveTimeouts: 0,
   degraded: false,
   circuitPause: CIRCUIT_BREAK_PAUSE_MS,
@@ -129,6 +151,9 @@ let pullDupCount = 0;
 let querySkipCount = 0;
 let queueTimeoutCount = 0;  // 队列中超时统计
 let creditExhaustedCount = 0;  // 额度耗尽触发次数
+let callbackTimeoutDiscards = 0;  // 回调阶段超时丢弃计数
+let discardDegradeTriggered = false;  // 丢弃率降级已触发
+let discardCircuitTriggered = false;  // 丢弃率熔断已触发
 
 // 上次统计输出时的快照（用于计算增量）
 let lastStatsPullCount = 0;
@@ -170,6 +195,79 @@ function getTaskLogHistory() {
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+/**
+ * 发送企业微信机器人告警
+ */
+async function sendWecomAlert(message) {
+  const webhookKey = config.wecom && config.wecom.webhookKey;
+  if (!webhookKey) {
+    logger.warn('[企业微信] 未配置 WECOM_WEBHOOK_KEY，跳过通知');
+    return;
+  }
+  try {
+    const axios = require('axios');
+    await axios.post(`https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=${webhookKey}`, {
+      msgtype: 'text',
+      text: { content: message },
+    }, { timeout: 10000 });
+    logger.info('[企业微信] 告警通知已发送');
+  } catch (err) {
+    logger.error(`[企业微信] 通知发送失败: ${err.message}`);
+  }
+}
+
+/**
+ * 检查超时丢弃率，联动降级 / 熔断 / 紧急停止
+ * 丢弃率 = 超时丢弃任务 / (回调成功 + 超时丢弃)
+ */
+function checkTimeoutDiscardRate() {
+  const totalDiscards = querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
+  const successCount = getTotalSuccessCount();
+  const total = successCount + totalDiscards;
+  if (total < DISCARD_CHECK_MIN_TOTAL) return;
+
+  const rate = totalDiscards / total;
+
+  // ≥20%：紧急停止，不可自动恢复
+  if (rate >= DISCARD_HARD_STOP_RATE && !hardStopped) {
+    hardStopped = true;
+    logger.error(`[紧急停止] 超时丢弃率 ${(rate * 100).toFixed(1)}% 超过 20%，停止所有拉取和查询，需人工恢复`);
+    sendWecomAlert(
+      `⚠️ 虾皮任务系统紧急告警\n\n` +
+      `超时丢弃率: ${(rate * 100).toFixed(1)}%（阈值 20%）\n` +
+      `回调成功: ${successCount}\n` +
+      `超时丢弃: ${totalDiscards}\n\n` +
+      `系统已自动停止拉取和查询，需人工介入恢复。`
+    );
+    return;
+  }
+
+  // ≥15%：熔断拉取和查询
+  if (rate >= DISCARD_CIRCUIT_RATE) {
+    if (!discardCircuitTriggered) {
+      discardCircuitTriggered = true;
+      logger.warn(`[超时熔断] 超时丢弃率 ${(rate * 100).toFixed(1)}% 超过 15%，拉取和查询熔断`);
+    }
+    pullHealth.consecutiveTimeouts = CIRCUIT_BREAK_THRESHOLD;
+    queryHealth.consecutiveTimeouts = CIRCUIT_BREAK_THRESHOLD;
+    return;
+  } else {
+    discardCircuitTriggered = false;
+  }
+
+  // ≥10%：降级拉取和查询
+  if (rate >= DISCARD_DEGRADE_RATE) {
+    if (!discardDegradeTriggered) {
+      discardDegradeTriggered = true;
+      logger.warn(`[超时降级] 超时丢弃率 ${(rate * 100).toFixed(1)}% 超过 10%，拉取和查询降级`);
+    }
+    if (!pullHealth.degraded) pullHealth.degraded = true;
+    if (!queryHealth.degraded) queryHealth.degraded = true;
+  } else {
+    discardDegradeTriggered = false;
+  }
 }
 
 /**
@@ -265,7 +363,7 @@ async function pullWorker(workerId) {
   activePullWorkers++;
   const PULL_CONCURRENCY = 5; // 每个 worker 内部并发数
 
-  while (!workersStopped && !pullingPaused && !autoPaused && !creditExhausted) {
+  while (!workersStopped && !pullingPaused && !autoPaused && !creditExhausted && !hardStopped) {
     // 熔断：上游连续故障过多，暂停等待恢复（递增暂停）
     if (pullHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
       if (workerId === 0) {
@@ -282,9 +380,7 @@ async function pullWorker(workerId) {
       continue;
     }
 
-    if (pullHealth.degraded) {
-      // 降级模式：单个串行拉取
-      // 全局多服务降级时额外增加间隔，减轻 event loop 压力
+    if (pullHealth.degraded || callbackHealth.degraded) {
       const globalLevel = getGlobalDegradeLevel();
       try {
         const task = await pullSingleTask();
@@ -348,7 +444,7 @@ async function pullWorker(workerId) {
  */
 async function queryWorker(workerId) {
   activeQueryWorkers++;
-  while (!workersStopped) {
+  while (!workersStopped && !hardStopped) {
     checkBackpressure();
 
     // 额度耗尽：worker 0 做探测，其他休眠
@@ -378,11 +474,11 @@ async function queryWorker(workerId) {
     }
 
     if (taskQueue.pendingCount === 0) {
-      await sleep(queryHealth.degraded ? 50 : 2);
+      await sleep((queryHealth.degraded || callbackHealth.degraded) ? 50 : 2);
       continue;
     }
 
-    if (queryHealth.degraded) {
+    if (queryHealth.degraded || callbackHealth.degraded) {
       // ===== 降级模式：串行处理单个任务 =====
       // 全局多服务降级时，进一步降低处理速度
       const globalLevel = getGlobalDegradeLevel();
@@ -591,6 +687,7 @@ function isCallbackTaskExpired(item) {
   if (age > 290000) {
     logger.info(`回调任务已超时丢弃: shop_id=${item.task.shop_id} item_id=${item.task.item_id} created_at=${item.task.created_at} age=${(age / 1000).toFixed(0)}s`);
     taskQueue.removeKey(item.task);
+    callbackTimeoutDiscards++;
     return true;
   }
   return false;
@@ -672,6 +769,7 @@ function cleanupLoop() {
     queueTimeoutCount += purged;  // 队列中超时计数
     logger.info(`清理超时任务: ${purged} 条`);
   }
+  checkTimeoutDiscardRate();
 }
 
 /**
@@ -689,6 +787,8 @@ async function callbackRetryLoop() {
  * 吞吐量统计日志（每 10 秒输出一次）
  */
 function statsLoop() {
+  checkTimeoutDiscardRate();
+
   const now = Date.now();
   const elapsed = (now - statsLastTime) / 1000;
   const currentSuccess = getTotalSuccessCount();
@@ -700,13 +800,18 @@ function statsLoop() {
   const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
   const deltaTimeout = queueTimeoutCount - lastStatsQueueTimeoutCount;
 
-  const queryMode = creditExhausted ? '额度耗尽' : queryHealth.degraded ? '降级' : '正常';
+  const totalDiscards = querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
+  const discardTotal = currentSuccess + totalDiscards;
+  const discardRate = discardTotal > 0 ? (totalDiscards / discardTotal * 100).toFixed(1) : '0.0';
+
+  const queryMode = creditExhausted ? '额度耗尽' : (queryHealth.degraded || callbackHealth.degraded) ? '降级' : '正常';
   const cbMode = callbackHealth.degraded ? '降级' : '正常';
-  const pullMode = pullHealth.degraded ? '退避' : '正常';
+  const pullMode = hardStopped ? '紧急停止' : (pullHealth.degraded || callbackHealth.degraded) ? '退避' : '正常';
   const globalLevel = getGlobalDegradeLevel();
   const globalTag = globalLevel >= 2 ? ` [全局降级L${globalLevel}]` : '';
+  const hardTag = hardStopped ? ' [紧急停止]' : '';
 
-  logger.info(`[统计]${globalTag} 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
+  logger.info(`[统计]${globalTag}${hardTag} 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${totalDiscards}(${discardRate}%) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
@@ -790,6 +895,7 @@ function startPulling() {
   pullingPaused = false;
   autoPaused = false;
   creditExhausted = false;
+  hardStopped = false;
 
   // 补足已退出的工作线程
   const pullNeeded = config.scheduler.pullSize - activePullWorkers;
@@ -828,35 +934,46 @@ function stopPulling() {
  * 获取调度器状态
  */
 function getStats() {
-  // 计算各阶段运行模式
-  const pullMode = creditExhausted ? '额度耗尽'
+  // 计算各阶段运行模式（联动回调降级）
+  const pullMode = hardStopped ? '紧急停止'
+    : creditExhausted ? '额度耗尽'
     : pullHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
-    : pullHealth.degraded ? '降级' : '正常';
-  const queryMode = creditExhausted ? '额度耗尽'
+    : (pullHealth.degraded || callbackHealth.degraded) ? '降级' : '正常';
+  const queryMode = hardStopped ? '紧急停止'
+    : creditExhausted ? '额度耗尽'
     : queryHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
-    : queryHealth.degraded ? '降级' : '正常';
+    : (queryHealth.degraded || callbackHealth.degraded) ? '降级' : '正常';
   const callbackMode = callbackHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
     : callbackHealth.degraded ? '降级' : '正常';
+
+  const totalDiscards = querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
+  const successCount = getTotalSuccessCount();
+  const discardTotal = successCount + totalDiscards;
+  const discardRate = discardTotal > 0 ? (totalDiscards / discardTotal * 100).toFixed(1) : '0.0';
 
   return {
     autoPaused,
     workersStopped,
     pullingPaused,
     creditExhausted,
+    hardStopped,
     activePullWorkers,
     activeQueryWorkers,
     activeCallbackWorkers,
     pullMode,
     queryMode,
     callbackMode,
-    pullDegraded: pullHealth.degraded,
-    queryDegraded: queryHealth.degraded,
+    pullDegraded: pullHealth.degraded || callbackHealth.degraded,
+    queryDegraded: queryHealth.degraded || callbackHealth.degraded,
     callbackDegraded: callbackHealth.degraded,
     callbackQueueLength: callbackQueue.length,
     pullCount,
     pullDupCount,
     querySkipCount,
     queueTimeoutCount,
+    callbackTimeoutDiscards,
+    totalDiscards,
+    discardRate: discardRate + '%',
     creditExhaustedCount,
   };
 }

@@ -8,15 +8,12 @@ const pullStats = {
   pullExpired: 0,
 };
 
-// 每分钟拉取次数统计（用于计算速率）
-const pullCountHistory = []; // [{ timestamp: number, count: number }]
+// 每分钟拉取次数统计（按秒聚合桶）
+const pullRateBuckets = new Map(); // secondTimestamp -> count
 
 function updatePullRate() {
-  const now = Date.now();
-  pullCountHistory.push({ timestamp: now, count: 1 });
-  while (pullCountHistory.length > 0 && now - pullCountHistory[0].timestamp > 120000) {
-    pullCountHistory.shift();
-  }
+  const sec = Math.floor(Date.now() / 1000);
+  pullRateBuckets.set(sec, (pullRateBuckets.get(sec) || 0) + 1);
 }
 
 /**
@@ -99,12 +96,17 @@ async function pullSingleTask() {
  * 获取拉取统计
  */
 function getPullStats() {
-  const now = Date.now();
-  const oneMinAgo = now - 60000;
-  const recentCount = pullCountHistory
-    .filter(item => item.timestamp > oneMinAgo)
-    .reduce((sum, item) => sum + item.count, 0);
-  return { ...pullStats, pullRatePerMin: recentCount };
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = now - 120;
+  let ratePerMin = 0;
+  for (const [sec, count] of pullRateBuckets) {
+    if (sec < cutoff) {
+      pullRateBuckets.delete(sec);
+    } else if (sec >= now - 60) {
+      ratePerMin += count;
+    }
+  }
+  return { ...pullStats, pullRatePerMin: ratePerMin };
 }
 
 module.exports = { pullSingleTask, pullBatchTask, getPullStats };

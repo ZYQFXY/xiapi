@@ -27,16 +27,12 @@ const queryStats = {
   creditExhaustedCount: 0, // 额度耗尽次数
 };
 
-// 每分钟查询次数统计（用于计算速率）
-const queryCountHistory = []; // [{ timestamp: number, count: number }]
+// 每分钟查询次数统计（按秒聚合桶，避免高 QPS 下 O(n) shift）
+const queryRateBuckets = new Map(); // secondTimestamp -> count
 
 function updateQueryRate() {
-  const now = Date.now();
-  queryCountHistory.push({ timestamp: now, count: 1 });
-  // 保留最近 2 分钟的数据
-  while (queryCountHistory.length > 0 && now - queryCountHistory[0].timestamp > 120000) {
-    queryCountHistory.shift();
-  }
+  const sec = Math.floor(Date.now() / 1000);
+  queryRateBuckets.set(sec, (queryRateBuckets.get(sec) || 0) + 1);
 }
 
 /**
@@ -129,12 +125,17 @@ async function querySingle(task) {
  * 获取数据请求统计
  */
 function getQueryStats() {
-  const now = Date.now();
-  const oneMinAgo = now - 60000;
-  const recentCount = queryCountHistory
-    .filter(item => item.timestamp > oneMinAgo)
-    .reduce((sum, item) => sum + item.count, 0);
-  return { ...queryStats, queryRatePerMin: recentCount };
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = now - 120;
+  let ratePerMin = 0;
+  for (const [sec, count] of queryRateBuckets) {
+    if (sec < cutoff) {
+      queryRateBuckets.delete(sec);
+    } else if (sec >= now - 60) {
+      ratePerMin += count;
+    }
+  }
+  return { ...queryStats, queryRatePerMin: ratePerMin };
 }
 
 /**

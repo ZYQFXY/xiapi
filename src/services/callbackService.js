@@ -12,18 +12,15 @@ const retryQueue = [];
 // 回调成功总计数
 let totalSuccessCount = 0;
 
-// 废弃任务总计数（重试超限丢弃）
+// 废弃任务总计数（超时丢弃）
 let totalDroppedCount = 0;
 
-// 每分钟回调次数统计（用于计算速率）
-const callbackCountHistory = []; // [{ timestamp: number, count: number }]
+// 每分钟回调次数统计（按秒聚合桶）
+const callbackRateBuckets = new Map(); // secondTimestamp -> count
 
 function updateCallbackRate() {
-  const now = Date.now();
-  callbackCountHistory.push({ timestamp: now, count: 1 });
-  while (callbackCountHistory.length > 0 && now - callbackCountHistory[0].timestamp > 120000) {
-    callbackCountHistory.shift();
-  }
+  const sec = Math.floor(Date.now() / 1000);
+  callbackRateBuckets.set(sec, (callbackRateBuckets.get(sec) || 0) + 1);
 }
 
 /**
@@ -111,7 +108,6 @@ function addToRetryQueue(task, data) {
 async function processRetryQueue() {
   if (retryQueue.length === 0) return { retried: 0, succeeded: 0, failed: 0, dropped: 0 };
 
-  const maxRetry = config.scheduler.callbackMaxRetry;
   const concurrency = config.scheduler.callbackConcurrency;
 
   const items = retryQueue.splice(0, retryQueue.length);
@@ -125,26 +121,30 @@ async function processRetryQueue() {
     const batch = items.slice(i, i + concurrency);
     await Promise.all(
       batch.map(async (item) => {
+        // 检查任务是否已超时（290秒），超时则丢弃
+        if (item.task.created_at) {
+          const age = Date.now() - new Date(item.task.created_at).getTime();
+          if (age > 290000) {
+            taskQueue.removeKey(item.task);
+            totalDroppedCount++;
+            logger.error(`回调重试超时丢弃: shop_id=${item.task.shop_id} good_id=${item.task.good_id} 已重试${item.retryCount}次 age=${(age / 1000).toFixed(0)}s`);
+            dropped++;
+            return;
+          }
+        }
         try {
           await callbackSingle(item.task, item.data);
           succeeded++;
         } catch (err) {
           logger.warn(`回调重试失败: shop_id=${item.task.shop_id} good_id=${item.task.good_id} err=${err.message}`);
-          if (item.retryCount >= maxRetry) {
-            taskQueue.removeKey(item.task);
-            totalDroppedCount++;
-            logger.error(`回调重试超限丢弃: shop_id=${item.task.shop_id} good_id=${item.task.good_id} 已重试${item.retryCount}次`);
-            dropped++;
-          } else {
-            retryQueue.push({ ...item, retryCount: item.retryCount + 1 });
-            failed++;
-          }
+          retryQueue.push({ ...item, retryCount: item.retryCount + 1 });
+          failed++;
         }
       })
     );
   }
 
-  logger.info(`回调重试完成: 成功=${succeeded} 再次失败=${failed} 丢弃=${dropped} 剩余重试队列=${retryQueue.length}`);
+  logger.info(`回调重试完成: 成功=${succeeded} 再次失败=${failed} 超时丢弃=${dropped} 剩余重试队列=${retryQueue.length}`);
   return { retried: items.length, succeeded, failed, dropped };
 }
 
@@ -177,12 +177,17 @@ function getTotalDroppedCount() {
 }
 
 function getCallbackRatePerMin() {
-  const now = Date.now();
-  const oneMinAgo = now - 60000;
-  const recentCount = callbackCountHistory
-    .filter(item => item.timestamp > oneMinAgo)
-    .reduce((sum, item) => sum + item.count, 0);
-  return recentCount;
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff = now - 120;
+  let ratePerMin = 0;
+  for (const [sec, count] of callbackRateBuckets) {
+    if (sec < cutoff) {
+      callbackRateBuckets.delete(sec);
+    } else if (sec >= now - 60) {
+      ratePerMin += count;
+    }
+  }
+  return ratePerMin;
 }
 
 module.exports = {
