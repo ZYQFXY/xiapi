@@ -48,10 +48,11 @@ const uploadClient = axios.create({
 
 /**
  * tokege HTTP 客户端（api.tokege.com）
+ * 不设置本地超时，由数据方接口自行控制超时
  */
 const tokegeClient = axios.create({
   baseURL: config.tokege.baseUrl,
-  timeout: config.httpTimeout,
+  timeout: 0,
   headers: {
     Authorization: config.tokege.token,
     'Content-Type': 'application/json',

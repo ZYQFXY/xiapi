@@ -27,9 +27,9 @@ const QUEUE_LOW_WATER = 2000;
 
 // ======== 外部 API 健康检测 & 自动降级 ========
 const HEALTH_WINDOW_MS = 60000;       // 60 秒统计窗口
-const DEGRADE_TIMEOUT_RATE = 0.85;    // 超时率 ≥ 85% 触发降级
-const RECOVER_TIMEOUT_RATE = 0.5;     // 超时率 < 50% 恢复正常
-const CIRCUIT_BREAK_THRESHOLD = 500;  // 连续超时 ≥ 500 次触发熔断暂停
+const DEGRADE_TIMEOUT_RATE = 0.7;     // 超时率 ≥ 70% 触发降级
+const RECOVER_TIMEOUT_RATE = 0.35;    // 超时率 < 35% 恢复正常
+const CIRCUIT_BREAK_THRESHOLD = 200;  // 连续超时 ≥ 200 次触发熔断暂停
 const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断初始暂停 10 秒
 const CIRCUIT_BREAK_MAX_PAUSE_MS = 60000; // 熔断最大暂停 60 秒
 const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
@@ -75,10 +75,10 @@ function recordSample(health, isTimeout, label) {
     health.consecutiveTimeouts = 0;
   }
 
-  // 计算窗口内超时率（采样检查，每 20 次检查一次减少开销）
+  // 计算窗口内超时率（采样检查，每 10 次检查一次减少开销）
   const total = health.samples.length;
-  if (total < 200) return;
-  if (total % 20 !== 0 && !isTimeout) return; // 非超时时降低检查频率
+  if (total < 100) return;
+  if (total % 10 !== 0 && !isTimeout) return; // 非超时时降低检查频率
 
   const timeoutRate = health.timeoutCount / total;
 
@@ -170,6 +170,18 @@ function getTaskLogHistory() {
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+/**
+ * 全局降级检查：当多个服务同时降级时，系统处于严重故障状态
+ * 返回降级的服务数量（0-3）
+ */
+function getGlobalDegradeLevel() {
+  let level = 0;
+  if (pullHealth.degraded || pullHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) level++;
+  if (queryHealth.degraded || queryHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) level++;
+  if (callbackHealth.degraded || callbackHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) level++;
+  return level;
 }
 
 /**
@@ -272,6 +284,8 @@ async function pullWorker(workerId) {
 
     if (pullHealth.degraded) {
       // 降级模式：单个串行拉取
+      // 全局多服务降级时额外增加间隔，减轻 event loop 压力
+      const globalLevel = getGlobalDegradeLevel();
       try {
         const task = await pullSingleTask();
         recordSample(pullHealth, false, '拉取');
@@ -286,7 +300,7 @@ async function pullWorker(workerId) {
       } catch (err) {
         recordSample(pullHealth, isUpstreamError(err), '拉取');
         logTask('pull', false, '', '');
-        await sleep(500);
+        await sleep(globalLevel >= 2 ? 2000 : 500);
       }
     } else {
       // 正常模式：并发拉取
@@ -364,12 +378,17 @@ async function queryWorker(workerId) {
     }
 
     if (taskQueue.pendingCount === 0) {
-      await sleep(queryHealth.degraded ? 10 : 2);
+      await sleep(queryHealth.degraded ? 50 : 2);
       continue;
     }
 
     if (queryHealth.degraded) {
       // ===== 降级模式：串行处理单个任务 =====
+      // 全局多服务降级时，进一步降低处理速度
+      const globalLevel = getGlobalDegradeLevel();
+      if (globalLevel >= 2) {
+        await sleep(100); // 多服务故障时每轮额外等待
+      }
       await queryProcessOne();
     } else {
       // ===== 正常模式：批量并发处理 =====
@@ -394,7 +413,10 @@ function isTaskExpired(task) {
 
 /** 正常模式：批量取任务并发处理 */
 async function queryProcessBatch() {
-  const tasks = taskQueue.dequeue(10);
+  // 有其他服务降级时，缩小批量避免过多并发 Promise
+  const globalLevel = getGlobalDegradeLevel();
+  const batchSize = globalLevel >= 1 ? 5 : 10;
+  const tasks = taskQueue.dequeue(batchSize);
   if (tasks.length === 0) {
     await sleep(2);
     return;
@@ -454,9 +476,11 @@ async function queryProcessBatch() {
 
 /** 降级模式：小批量串行处理 */
 async function queryProcessOne() {
-  const tasks = taskQueue.dequeue(3);
+  const globalLevel = getGlobalDegradeLevel();
+  const batchSize = globalLevel >= 2 ? 1 : 3;
+  const tasks = taskQueue.dequeue(batchSize);
   if (tasks.length === 0) {
-    await sleep(10);
+    await sleep(50);
     return;
   }
 
@@ -496,6 +520,8 @@ async function queryProcessOne() {
       recordSample(queryHealth, isUpstreamError(err), '查询');
       logger.warn(`查询网络异常: shop_id=${task.shop_id} item_id=${task.item_id} err=${err.message}`);
       taskQueue.requeue([task]);
+      // 降级模式下出错后冷却，避免连续错误打爆 event loop
+      await sleep(globalLevel >= 2 ? 1000 : 300);
     }
   }
 }
@@ -526,11 +552,16 @@ async function callbackWorker(workerId) {
     }
 
     if (callbackQueue.length === 0) {
-      await sleep(callbackHealth.degraded ? 10 : 2);
+      await sleep(callbackHealth.degraded ? 50 : 2);
       continue;
     }
 
     if (callbackHealth.degraded) {
+      // 全局多服务降级时额外等待
+      const globalLevel = getGlobalDegradeLevel();
+      if (globalLevel >= 2) {
+        await sleep(100);
+      }
       await callbackProcessOne();
     } else {
       await callbackProcessBatch();
@@ -559,7 +590,10 @@ function handleCallbackFailure(item) {
 
 /** 正常模式：批量并发回调 */
 async function callbackProcessBatch() {
-  const batchSize = Math.min(15, callbackQueue.length);
+  // 有其他服务降级时，缩小批量
+  const globalLevel = getGlobalDegradeLevel();
+  const maxBatch = globalLevel >= 1 ? 8 : 15;
+  const batchSize = Math.min(maxBatch, callbackQueue.length);
   const items = [];
   for (let i = 0; i < batchSize; i++) {
     const item = callbackQueue.shift();
@@ -587,7 +621,9 @@ async function callbackProcessBatch() {
 
 /** 降级模式：小批量串行回调 */
 async function callbackProcessOne() {
-  const batchSize = Math.min(3, callbackQueue.length);
+  const globalLevel = getGlobalDegradeLevel();
+  const maxBatch = globalLevel >= 2 ? 1 : 3;
+  const batchSize = Math.min(maxBatch, callbackQueue.length);
   const items = [];
   for (let i = 0; i < batchSize; i++) {
     const item = callbackQueue.shift();
@@ -607,6 +643,8 @@ async function callbackProcessOne() {
       logTask('callback', false, item.task.shop_id, item.task.item_id);
       logger.warn(`回调失败: shop_id=${item.task.shop_id} good_id=${item.task.good_id} err=${err.message}`);
       handleCallbackFailure(item);
+      // 降级模式下出错后冷却
+      await sleep(globalLevel >= 2 ? 1000 : 300);
     }
   }
 }
@@ -651,8 +689,10 @@ function statsLoop() {
   const queryMode = creditExhausted ? '额度耗尽' : queryHealth.degraded ? '降级' : '正常';
   const cbMode = callbackHealth.degraded ? '降级' : '正常';
   const pullMode = pullHealth.degraded ? '退避' : '正常';
+  const globalLevel = getGlobalDegradeLevel();
+  const globalTag = globalLevel >= 2 ? ` [全局降级L${globalLevel}]` : '';
 
-  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
+  logger.info(`[统计]${globalTag} 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
