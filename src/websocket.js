@@ -75,7 +75,7 @@ async function fetchCredits() {
 }
 
 fetchCredits();
-setInterval(fetchCredits, 30000);
+setInterval(fetchCredits, 10000);
 
 const MAX_BUFFERED = 64 * 1024; // 64KB，超过则跳过推送避免堆积
 
