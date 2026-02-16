@@ -1,5 +1,7 @@
 const { WebSocketServer } = require('ws');
 const logger = require('./utils/logger');
+const { curnumClient, tokegeClient } = require('./utils/http');
+const config = require('./config');
 const { getQueryStats } = require('./services/queryService');
 const { getPullStats } = require('./services/pullService');
 const {
@@ -16,6 +18,60 @@ let lastLogIndex = 0;
 const MAX_LOGS_PER_BROADCAST = 50;
 
 const HEARTBEAT_INTERVAL = 30000; // 30秒发一次心跳
+
+// ======== curnum 当天任务量轮询 ========
+const curnumData = { initial: null, current: 0, sessionIncrement: 0 };
+let curnumTimer = null;
+
+function getTodayDate() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+async function fetchCurnum() {
+  try {
+    const phone = config.upstream.phone;
+    const date = getTodayDate();
+    const res = await curnumClient.get(`/api/curnum?phone=${phone}&date=${date}`);
+    if (res.data && res.data.status === 200 && typeof res.data.data === 'number') {
+      const val = res.data.data;
+      if (curnumData.initial === null) {
+        curnumData.initial = val;
+      }
+      curnumData.current = val;
+      curnumData.sessionIncrement = val - curnumData.initial;
+    }
+  } catch (err) {
+    // 轮询失败静默忽略，不影响主业务
+  }
+}
+
+function startCurnumPolling() {
+  fetchCurnum();
+  curnumTimer = setInterval(fetchCurnum, 10000);
+}
+
+startCurnumPolling();
+
+// ======== tokege 余额轮询 ========
+let tokegeCredits = null;
+
+async function fetchCredits() {
+  try {
+    const res = await tokegeClient.get('/tokens/credits', { timeout: 10000 });
+    if (res.data && res.data._success && Array.isArray(res.data.credits) && res.data.credits.length > 0) {
+      tokegeCredits = Math.abs(res.data.credits[0].credit);
+    }
+  } catch (err) {
+    // 轮询失败静默忽略
+  }
+}
+
+fetchCredits();
+setInterval(fetchCredits, 30000);
 
 function safeSend(ws, data) {
   try {
@@ -140,6 +196,8 @@ function collectStats() {
     pullStats: getPullStats(),
     schedulerStats: scheduler.getStats(),
     schedulerRunning: scheduler.isRunning(),
+    curnumData: { ...curnumData },
+    tokegeCredits,
   };
 }
 

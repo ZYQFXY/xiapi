@@ -22,6 +22,8 @@ const uploadHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 200 });
 const uploadHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 200 });
 const tokegeHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 500 });
 const tokegeHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 500 });
+const curnumHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 2 });
+const curnumHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 2 });
 
 /**
  * 上游拉取任务 HTTP 客户端（103.207.68.206:3000）
@@ -61,8 +63,19 @@ const tokegeClient = axios.create({
   httpsAgent: tokegeHttpsAgent,
 });
 
+/**
+ * curnum 当天任务量查询客户端（103.207.68.206:3600）
+ */
+const curnumClient = axios.create({
+  baseURL: config.upstream.curnumBaseUrl,
+  timeout: 10000,
+  headers: { 'Content-Type': 'application/json' },
+  httpAgent: curnumHttpAgent,
+  httpsAgent: curnumHttpsAgent,
+});
+
 // 请求拦截器 - 记录请求
-[pullClient, uploadClient, tokegeClient].forEach(client => {
+[pullClient, uploadClient, tokegeClient, curnumClient].forEach(client => {
   client.interceptors.request.use(req => {
     logger.debug(`HTTP ${req.method.toUpperCase()} ${req.baseURL}${req.url}`);
     return req;
@@ -82,4 +95,4 @@ const tokegeClient = axios.create({
   );
 });
 
-module.exports = { pullClient, uploadClient, tokegeClient };
+module.exports = { pullClient, uploadClient, tokegeClient, curnumClient };

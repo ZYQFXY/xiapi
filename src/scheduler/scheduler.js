@@ -425,6 +425,13 @@ async function queryProcessBatch() {
   const promises = tasks.map(async (task) => {
     if (isTaskExpired(task)) return null;
 
+    // 二次拦截：任务已被处理过（回调成功/丢弃），跳过查询
+    if (taskQueue.isProcessed(task)) {
+      taskQueue.removeKey(task);
+      pullDupCount++;
+      return null;
+    }
+
     if (task.retry_after && Date.now() < task.retry_after) {
       taskQueue.requeueSilent(task);
       return null;
@@ -486,6 +493,13 @@ async function queryProcessOne() {
 
   for (const task of tasks) {
     if (isTaskExpired(task)) continue;
+
+    // 二次拦截：任务已被处理过（回调成功/丢弃），跳过查询
+    if (taskQueue.isProcessed(task)) {
+      taskQueue.removeKey(task);
+      pullDupCount++;
+      continue;
+    }
 
     if (task.retry_after && Date.now() < task.retry_after) {
       taskQueue.requeueSilent(task);

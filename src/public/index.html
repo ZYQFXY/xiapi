@@ -18,16 +18,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .status-dot.disconnected { background: #f44336; }
 
 /* 指标卡片 */
-.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 16px 24px; }
+.metrics { display: grid; grid-template-columns: repeat(6, 1fr); gap: 16px; padding: 16px 24px; }
 .metric-card { background: #1a2a3a; border-radius: 8px; padding: 16px; border-left: 4px solid; }
 .metric-card.green { border-color: #4caf50; }
 .metric-card.blue { border-color: #2196f3; }
 .metric-card.red { border-color: #f44336; }
+.metric-card.orange { border-color: #ff9800; }
+.metric-card.purple { border-color: #ab47bc; }
 .metric-card .label { font-size: 13px; color: #90a4ae; margin-bottom: 8px; }
 .metric-card .value { font-size: 28px; font-weight: bold; }
+.metric-card .sub-value { font-size: 14px; color: #90a4ae; margin-top: 4px; }
 .metric-card.green .value { color: #4caf50; }
 .metric-card.blue .value { color: #2196f3; }
 .metric-card.red .value { color: #f44336; }
+.metric-card.orange .value { color: #ff9800; }
+.metric-card.orange .sub-value { color: #ffb74d; }
+.metric-card.purple .value { color: #ce93d8; }
 
 /* 统计面板 */
 .panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 0 24px 16px; }
@@ -114,6 +120,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
     <div class="label">废弃任务数</div>
     <div class="value" id="m-dropped">0</div>
   </div>
+  <div class="metric-card orange">
+    <div class="label">当天任务量</div>
+    <div class="value" id="m-curnum">0</div>
+    <div class="sub-value">本次新增: <span id="m-curnum-inc">+0</span></div>
+  </div>
+  <div class="metric-card purple">
+    <div class="label">API 余额</div>
+    <div class="value" id="m-credits">--</div>
+  </div>
 </div>
 
 <div class="panels">
@@ -137,8 +152,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <div class="panel">
     <h3>队列状态 <span class="rate-value" id="s-pull-rate">0</span> 条/分</h3>
     <div class="stat-row"><span class="stat-label">待处理任务</span><span class="stat-value" id="s-q-pending">0</span></div>
-    <div class="stat-row"><span class="stat-label">去重键数</span><span class="stat-value" id="s-q-dedupe">0</span></div>
-    <div class="stat-row"><span class="stat-label">拉取去重</span><span class="stat-value" id="s-pull-dup">0</span></div>
+    <div class="stat-row"><span class="stat-label">在途去重键</span><span class="stat-value" id="s-q-dedupe">0</span></div>
+    <div class="stat-row"><span class="stat-label">已处理(永久去重)</span><span class="stat-value" id="s-q-processed">0</span></div>
+    <div class="stat-row"><span class="stat-label">拉取去重(丢弃)</span><span class="stat-value" id="s-pull-dup">0</span></div>
     <div class="stat-row"><span class="stat-label">超时丢弃</span><span class="stat-value" id="s-query-skip">0</span></div>
     <div class="stat-row"><span class="stat-label">队列中超时</span><span class="stat-value" id="s-queue-timeout">0</span></div>
     <div class="stat-row"><span class="stat-label">回调队列</span><span class="stat-value" id="s-cb-queue">0</span></div>
@@ -237,6 +253,15 @@ function updateStats(data) {
   $('m-query-success').textContent = (data.queryStats && data.queryStats.successCount) || 0;
   $('m-dropped').textContent = data.callbackDropped || 0;
 
+  if (data.curnumData) {
+    $('m-curnum').textContent = data.curnumData.current || 0;
+    $('m-curnum-inc').textContent = '+' + (data.curnumData.sessionIncrement || 0);
+  }
+
+  if (data.tokegeCredits !== null && data.tokegeCredits !== undefined) {
+    $('m-credits').textContent = data.tokegeCredits.toLocaleString();
+  }
+
   if (data.queryStats) {
     $('s-total-requests').textContent = data.queryStats.totalRequests || 0;
     $('s-query-success').textContent = data.queryStats.successCount || 0;
@@ -261,6 +286,7 @@ function updateStats(data) {
   if (data.queueStats) {
     $('s-q-pending').textContent = data.queueStats.pending || 0;
     $('s-q-dedupe').textContent = data.queueStats.dedupeKeys || 0;
+    $('s-q-processed').textContent = data.queueStats.processedKeys || 0;
   }
 
   if (data.schedulerStats) {

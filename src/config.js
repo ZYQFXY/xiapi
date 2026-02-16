@@ -9,6 +9,7 @@ module.exports = {
     uploadBaseUrl: process.env.UPSTREAM_UPLOAD_URL || 'http://103.207.68.206:9000',
     phone: process.env.PHONE || '18888888888',
     country: process.env.COUNTRY || 'tw',
+    curnumBaseUrl: process.env.CURNUM_BASE_URL || 'http://103.207.68.206:3600',
   },
 
   tokege: {
