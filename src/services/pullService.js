@@ -20,51 +20,79 @@ function updatePullRate() {
 }
 
 /**
- * 从上游拉取单个任务
- * GET /api/get/task?phone=xxx
- * @returns {Object|null} 转换后的任务对象，无任务返回 null
+ * 从上游批量拉取任务
+ * GET /api/get/task?phone=xxx&size=N
+ * @param {number} size - 批量拉取数量
+ * @returns {Array} 转换后的任务对象数组，无任务返回空数组
  * @throws {Error} 网络/服务器错误时抛出，由调用方处理
  */
-async function pullSingleTask() {
+async function pullBatchTask(size) {
   const res = await pullClient.get('/api/get/task', {
     params: {
       phone: config.upstream.phone,
+      size: size || config.scheduler.batchSize,
     },
   });
 
   const body = res.data;
 
-  // 响应格式: { code: 200, success: true, task: { type, data: { ... } } }
-  if (!body || !body.success || !body.task || !body.task.data) {
-    return null;
+  if (!body || !body.success) {
+    return [];
   }
 
-  const taskData = body.task.data;
-  const taskType = body.task.type;
+  // 兼容两种响应格式：
+  // 单个: { success: true, task: { type, data: { ... } } }
+  // 批量: { success: true, tasks: [{ type, data: { ... } }, ...] }
+  let rawTasks = [];
+  if (body.tasks && Array.isArray(body.tasks)) {
+    rawTasks = body.tasks;
+  } else if (body.task && body.task.data) {
+    rawTasks = [body.task];
+  } else {
+    return [];
+  }
 
-  // 检查任务是否超时（created_at 超过24分钟则丢弃）
-  if (taskData.created_at) {
-    const createdTime = new Date(taskData.created_at).getTime();
-    if (Date.now() - createdTime > config.scheduler.pullTaskTimeout) {
-      pullStats.pullExpired++;
-      logger.info(`拉取任务已超时丢弃: shop_id=${taskData.shop_id} good_id=${taskData.good_id} created_at=${taskData.created_at}`);
-      return null;
+  const results = [];
+  for (const raw of rawTasks) {
+    if (!raw || !raw.data) continue;
+    const taskData = raw.data;
+    const taskType = raw.type;
+
+    // 检查任务是否超时
+    if (taskData.created_at) {
+      const createdTime = new Date(taskData.created_at).getTime();
+      if (Date.now() - createdTime > config.scheduler.pullTaskTimeout) {
+        pullStats.pullExpired++;
+        continue;
+      }
     }
+
+    pullStats.totalPulled++;
+    updatePullRate();
+
+    results.push({
+      shop_id: taskData.shop_id,
+      item_id: taskData.good_id,
+      good_id: taskData.good_id,
+      country: taskData.country,
+      trace_id: taskData.trace_id,
+      type: taskType,
+      created_at: taskData.created_at,
+      token: taskData.token,
+    });
   }
 
-  pullStats.totalPulled++;
-  updatePullRate();
+  return results;
+}
 
-  return {
-    shop_id: taskData.shop_id,
-    item_id: taskData.good_id,   // good_id 转换为 item_id（tokege 查询使用）
-    good_id: taskData.good_id,   // 保留原始 good_id 供回调使用
-    country: taskData.country,
-    trace_id: taskData.trace_id,
-    type: taskType,              // 保留任务类型供回调使用
-    created_at: taskData.created_at,
-    token: taskData.token,
-  };
+/**
+ * 从上游拉取单个任务（兼容旧逻辑）
+ * @returns {Object|null}
+ * @throws {Error}
+ */
+async function pullSingleTask() {
+  const tasks = await pullBatchTask(1);
+  return tasks.length > 0 ? tasks[0] : null;
 }
 
 /**
@@ -79,4 +107,4 @@ function getPullStats() {
   return { ...pullStats, pullRatePerMin: recentCount };
 }
 
-module.exports = { pullSingleTask, getPullStats };
+module.exports = { pullSingleTask, pullBatchTask, getPullStats };

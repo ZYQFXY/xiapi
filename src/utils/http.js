@@ -5,8 +5,19 @@ const config = require('../config');
 const logger = require('./logger');
 
 // 连接复用 Agent，各客户端独立 Agent 避免互相争抢连接
-const pullHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 60 });
-const pullHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 60 });
+// 拉取：高并发短请求，优化连接复用
+const pullHttpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 300,
+  maxFreeSockets: 50,
+  scheduling: 'lifo',     // 后进先出，优先复用热连接
+});
+const pullHttpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 300,
+  maxFreeSockets: 50,
+  scheduling: 'lifo',
+});
 const uploadHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 200 });
 const uploadHttpsAgent = new https.Agent({ keepAlive: true, maxSockets: 200 });
 const tokegeHttpAgent = new http.Agent({ keepAlive: true, maxSockets: 500 });

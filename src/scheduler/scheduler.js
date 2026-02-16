@@ -31,7 +31,8 @@ const HEALTH_WINDOW_MS = 30000;       // 30 秒统计窗口
 const DEGRADE_TIMEOUT_RATE = 0.7;     // 超时率 ≥ 70% 触发降级
 const RECOVER_TIMEOUT_RATE = 0.3;     // 超时率 < 30% 恢复正常
 const CIRCUIT_BREAK_THRESHOLD = 100;  // 连续超时 ≥ 100 次触发熔断暂停
-const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断暂停 10 秒
+const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断初始暂停 10 秒
+const CIRCUIT_BREAK_MAX_PAUSE_MS = 60000; // 熔断最大暂停 60 秒
 const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
 
 // 查询服务健康状态
@@ -39,6 +40,7 @@ const queryHealth = {
   samples: [],          // { ts, timeout: bool }
   consecutiveTimeouts: 0,
   degraded: false,      // true = 降级模式（串行），false = 正常模式（批量并发）
+  circuitPause: CIRCUIT_BREAK_PAUSE_MS, // 当前熔断暂停时长（递增）
 };
 
 // 回调服务健康状态
@@ -46,6 +48,7 @@ const callbackHealth = {
   samples: [],
   consecutiveTimeouts: 0,
   degraded: false,
+  circuitPause: CIRCUIT_BREAK_PAUSE_MS,
 };
 
 /**
@@ -81,6 +84,7 @@ function recordSample(health, isTimeout, label) {
     logger.warn(`[降级] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，切换为串行模式`);
   } else if (health.degraded && timeoutRate < RECOVER_TIMEOUT_RATE) {
     health.degraded = false;
+    health.circuitPause = CIRCUIT_BREAK_PAUSE_MS; // 恢复正常，重置熔断暂停时长
     logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，恢复批量并发模式`);
   }
 }
@@ -90,6 +94,7 @@ const pullHealth = {
   samples: [],
   consecutiveTimeouts: 0,
   degraded: false,
+  circuitPause: CIRCUIT_BREAK_PAUSE_MS,
 };
 
 /**
@@ -235,17 +240,23 @@ async function creditProbe() {
 }
 
 /**
- * 拉取工作线程：串行拉取，带健康检测 / 降级 / 熔断
+ * 拉取工作线程：内部并发拉取，带健康检测 / 降级 / 熔断
+ *   正常模式 → 每轮并发 5 个请求
+ *   降级模式 → 每轮单个请求
  */
 async function pullWorker(workerId) {
   activePullWorkers++;
+  const PULL_CONCURRENCY = 5; // 每个 worker 内部并发数
+
   while (!workersStopped && !pullingPaused && !autoPaused && !creditExhausted) {
-    // 熔断：上游连续故障过多，暂停等待恢复
+    // 熔断：上游连续故障过多，暂停等待恢复（递增暂停）
     if (pullHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
       if (workerId === 0) {
-        logger.warn(`[熔断] 拉取连续故障 ${pullHealth.consecutiveTimeouts} 次，暂停 ${CIRCUIT_BREAK_PAUSE_MS / 1000} 秒`);
+        logger.warn(`[熔断] 拉取连续故障 ${pullHealth.consecutiveTimeouts} 次，暂停 ${pullHealth.circuitPause / 1000} 秒`);
       }
-      await sleep(CIRCUIT_BREAK_PAUSE_MS);
+      await sleep(pullHealth.circuitPause);
+      // 递增下次暂停时长，上限 60 秒
+      pullHealth.circuitPause = Math.min(pullHealth.circuitPause * 2, CIRCUIT_BREAK_MAX_PAUSE_MS);
       pullHealth.consecutiveTimeouts = 0;
       if (!pullHealth.degraded) {
         pullHealth.degraded = true;
@@ -254,27 +265,57 @@ async function pullWorker(workerId) {
       continue;
     }
 
-    try {
-      const task = await pullSingleTask();
-      recordSample(pullHealth, false, '拉取');
-      if (task) {
-        pullCount++;
-        const added = taskQueue.enqueue([task]);
-        if (added === 0) pullDupCount++;
-        logTask('pull', true, task.shop_id, task.item_id);
-      } else {
-        // 无任务，短等待
-        await sleep(pullHealth.degraded ? 100 : 30);
+    if (pullHealth.degraded) {
+      // 降级模式：单个串行拉取
+      try {
+        const task = await pullSingleTask();
+        recordSample(pullHealth, false, '拉取');
+        if (task) {
+          pullCount++;
+          const added = taskQueue.enqueue([task]);
+          if (added === 0) pullDupCount++;
+          logTask('pull', true, task.shop_id, task.item_id);
+        } else {
+          await sleep(100);
+        }
+      } catch (err) {
+        recordSample(pullHealth, isUpstreamError(err), '拉取');
+        logTask('pull', false, '', '');
+        await sleep(500);
       }
-    } catch (err) {
-      const upstream = isUpstreamError(err);
-      recordSample(pullHealth, upstream, '拉取');
-      logTask('pull', false, '', '');
-      if (upstream) {
-        logger.warn(`拉取上游故障: ${err.message}`);
+    } else {
+      // 正常模式：并发拉取
+      const promises = [];
+      for (let i = 0; i < PULL_CONCURRENCY; i++) {
+        promises.push(
+          pullSingleTask()
+            .then(task => ({ ok: true, task }))
+            .catch(err => ({ ok: false, err }))
+        );
       }
-      // 降级时退避更长
-      await sleep(pullHealth.degraded ? 500 : 100);
+
+      const results = await Promise.all(promises);
+      let gotTask = false;
+
+      for (const r of results) {
+        if (r.ok) {
+          recordSample(pullHealth, false, '拉取');
+          if (r.task) {
+            gotTask = true;
+            pullCount++;
+            const added = taskQueue.enqueue([r.task]);
+            if (added === 0) pullDupCount++;
+            logTask('pull', true, r.task.shop_id, r.task.item_id);
+          }
+        } else {
+          recordSample(pullHealth, isUpstreamError(r.err), '拉取');
+          logTask('pull', false, '', '');
+        }
+      }
+
+      if (!gotTask) {
+        await sleep(30);
+      }
     }
   }
   activePullWorkers--;
@@ -301,12 +342,13 @@ async function queryWorker(workerId) {
       continue;
     }
 
-    // 熔断：连续超时过多，暂停一段时间
+    // 熔断：连续超时过多，暂停等待恢复（递增暂停）
     if (queryHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
       if (workerId === 0) {
-        logger.warn(`[熔断] 查询连续超时 ${queryHealth.consecutiveTimeouts} 次，暂停 ${CIRCUIT_BREAK_PAUSE_MS / 1000} 秒`);
+        logger.warn(`[熔断] 查询连续超时 ${queryHealth.consecutiveTimeouts} 次，暂停 ${queryHealth.circuitPause / 1000} 秒`);
       }
-      await sleep(CIRCUIT_BREAK_PAUSE_MS);
+      await sleep(queryHealth.circuitPause);
+      queryHealth.circuitPause = Math.min(queryHealth.circuitPause * 2, CIRCUIT_BREAK_MAX_PAUSE_MS);
       queryHealth.consecutiveTimeouts = 0;
       // 熔断恢复后强制进入降级模式，避免批量并发再次打死 event loop
       if (!queryHealth.degraded) {
@@ -462,12 +504,13 @@ async function queryProcessOne() {
 async function callbackWorker(workerId) {
   activeCallbackWorkers++;
   while (!workersStopped) {
-    // 熔断
+    // 熔断（递增暂停）
     if (callbackHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
       if (workerId === 0) {
-        logger.warn(`[熔断] 回调连续超时 ${callbackHealth.consecutiveTimeouts} 次，暂停 ${CIRCUIT_BREAK_PAUSE_MS / 1000} 秒`);
+        logger.warn(`[熔断] 回调连续超时 ${callbackHealth.consecutiveTimeouts} 次，暂停 ${callbackHealth.circuitPause / 1000} 秒`);
       }
-      await sleep(CIRCUIT_BREAK_PAUSE_MS);
+      await sleep(callbackHealth.circuitPause);
+      callbackHealth.circuitPause = Math.min(callbackHealth.circuitPause * 2, CIRCUIT_BREAK_MAX_PAUSE_MS);
       callbackHealth.consecutiveTimeouts = 0;
       // 熔断恢复后强制进入降级模式
       if (!callbackHealth.degraded) {
@@ -726,6 +769,16 @@ function stopPulling() {
  * 获取调度器状态
  */
 function getStats() {
+  // 计算各阶段运行模式
+  const pullMode = creditExhausted ? '额度耗尽'
+    : pullHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
+    : pullHealth.degraded ? '降级' : '正常';
+  const queryMode = creditExhausted ? '额度耗尽'
+    : queryHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
+    : queryHealth.degraded ? '降级' : '正常';
+  const callbackMode = callbackHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
+    : callbackHealth.degraded ? '降级' : '正常';
+
   return {
     autoPaused,
     workersStopped,
@@ -734,6 +787,9 @@ function getStats() {
     activePullWorkers,
     activeQueryWorkers,
     activeCallbackWorkers,
+    pullMode,
+    queryMode,
+    callbackMode,
     pullDegraded: pullHealth.degraded,
     queryDegraded: queryHealth.degraded,
     callbackDegraded: callbackHealth.degraded,

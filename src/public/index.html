@@ -54,6 +54,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 .scheduler-status.sleeping { background: rgba(255,152,0,0.2); color: #ff9800; }
 .scheduler-status.credit-exhausted { background: rgba(156,39,176,0.2); color: #ce93d8; }
 
+/* 系统状态栏 */
+.status-bar { padding: 0 24px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.status-bar .label { font-size: 13px; color: #90a4ae; margin-right: 4px; }
+.status-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 12px; border-radius: 4px; font-weight: 500; }
+.status-badge .badge-label { color: #90a4ae; }
+.status-badge.normal { background: rgba(76,175,80,0.15); color: #4caf50; }
+.status-badge.degraded { background: rgba(255,152,0,0.2); color: #ff9800; }
+.status-badge.circuit-break { background: rgba(244,67,54,0.2); color: #f44336; }
+.status-badge.exhausted { background: rgba(156,39,176,0.2); color: #ce93d8; }
+.status-badge.backpressure { background: rgba(255,152,0,0.2); color: #ff9800; }
+
 /* 任务日志三面板 */
 .task-logs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 0 24px 24px; }
 .task-log-panel { background: #1a2a3a; border-radius: 8px; padding: 12px; }
@@ -142,6 +153,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <button class="btn btn-pull-start" id="btn-pull-start" onclick="sendCmd('startPulling')">启动拉取</button>
   <button class="btn btn-pull-stop" id="btn-pull-stop" onclick="sendCmd('stopPulling')">停止拉取</button>
   <span class="scheduler-status stopped" id="scheduler-status">已停止</span>
+</div>
+
+<div class="status-bar">
+  <span class="label">系统状态:</span>
+  <span class="status-badge normal" id="sb-pull"><span class="badge-label">拉取</span> 正常</span>
+  <span class="status-badge normal" id="sb-query"><span class="badge-label">查询</span> 正常</span>
+  <span class="status-badge normal" id="sb-callback"><span class="badge-label">回调</span> 正常</span>
+  <span class="status-badge normal" id="sb-backpressure"><span class="badge-label">背压</span> 正常</span>
+  <span class="status-badge normal" id="sb-credit"><span class="badge-label">额度</span> 正常</span>
 </div>
 
 <div class="task-logs">
@@ -270,6 +290,49 @@ function updateStats(data) {
   $('btn-stop').disabled = !data.schedulerRunning;
   $('btn-pull-start').disabled = !data.schedulerRunning || (data.schedulerStats && !data.schedulerStats.pullingPaused && !data.schedulerStats.autoPaused);
   $('btn-pull-stop').disabled = !data.schedulerRunning || (data.schedulerStats && (data.schedulerStats.pullingPaused || data.schedulerStats.autoPaused));
+
+  // 系统状态栏
+  if (data.schedulerStats) {
+    updateBadge('sb-pull', data.schedulerStats.pullMode);
+    updateBadge('sb-query', data.schedulerStats.queryMode);
+    updateBadge('sb-callback', data.schedulerStats.callbackMode);
+
+    var bpEl = $('sb-backpressure');
+    if (data.schedulerStats.autoPaused) {
+      bpEl.className = 'status-badge backpressure';
+      bpEl.innerHTML = '<span class="badge-label">背压</span> 暂停';
+    } else {
+      bpEl.className = 'status-badge normal';
+      bpEl.innerHTML = '<span class="badge-label">背压</span> 正常';
+    }
+
+    var crEl = $('sb-credit');
+    if (data.schedulerStats.creditExhausted) {
+      crEl.className = 'status-badge exhausted';
+      crEl.innerHTML = '<span class="badge-label">额度</span> 耗尽';
+    } else {
+      crEl.className = 'status-badge normal';
+      crEl.innerHTML = '<span class="badge-label">额度</span> 正常';
+    }
+  }
+}
+
+function updateBadge(id, mode) {
+  var el = $(id);
+  var label = el.querySelector('.badge-label').textContent;
+  if (mode === '熔断') {
+    el.className = 'status-badge circuit-break';
+    el.innerHTML = '<span class="badge-label">' + label + '</span> 熔断';
+  } else if (mode === '降级') {
+    el.className = 'status-badge degraded';
+    el.innerHTML = '<span class="badge-label">' + label + '</span> 降级';
+  } else if (mode === '额度耗尽') {
+    el.className = 'status-badge exhausted';
+    el.innerHTML = '<span class="badge-label">' + label + '</span> 额度耗尽';
+  } else {
+    el.className = 'status-badge normal';
+    el.innerHTML = '<span class="badge-label">' + label + '</span> 正常';
+  }
 }
 
 // ======== 任务日志渲染 ========
