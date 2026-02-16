@@ -35,5 +35,6 @@ module.exports = {
   },
 
   httpTimeout: parseInt(process.env.HTTP_TIMEOUT, 10) || 30000,
+  pullTimeout: parseInt(process.env.PULL_TIMEOUT, 10) || 15000,
   callbackTimeout: parseInt(process.env.CALLBACK_TIMEOUT, 10) || 30000,
 };

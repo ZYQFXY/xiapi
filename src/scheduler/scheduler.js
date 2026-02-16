@@ -27,10 +27,10 @@ const QUEUE_LOW_WATER = 2000;
 
 // ======== 外部 API 健康检测 & 自动降级 ========
 // 滑动窗口统计：最近 WINDOW_SIZE 秒内的成功/超时次数
-const HEALTH_WINDOW_MS = 15000;       // 15 秒统计窗口
-const DEGRADE_TIMEOUT_RATE = 0.5;     // 超时率 ≥ 50% 触发降级
-const RECOVER_TIMEOUT_RATE = 0.1;     // 超时率 < 10% 恢复正常
-const CIRCUIT_BREAK_THRESHOLD = 30;   // 连续超时 ≥ 30 次触发熔断暂停
+const HEALTH_WINDOW_MS = 30000;       // 30 秒统计窗口
+const DEGRADE_TIMEOUT_RATE = 0.7;     // 超时率 ≥ 70% 触发降级
+const RECOVER_TIMEOUT_RATE = 0.3;     // 超时率 < 30% 恢复正常
+const CIRCUIT_BREAK_THRESHOLD = 100;  // 连续超时 ≥ 100 次触发熔断暂停
 const CIRCUIT_BREAK_PAUSE_MS = 10000; // 熔断暂停 10 秒
 const CREDIT_PROBE_INTERVAL = 30000; // 额度探测间隔 30 秒
 
@@ -83,6 +83,29 @@ function recordSample(health, isTimeout, label) {
     health.degraded = false;
     logger.info(`[恢复] ${label}超时率 ${(timeoutRate * 100).toFixed(0)}% (${timeoutCount}/${total})，恢复批量并发模式`);
   }
+}
+
+// 拉取服务健康状态（与 queryHealth/callbackHealth 统一体系）
+const pullHealth = {
+  samples: [],
+  consecutiveTimeouts: 0,
+  degraded: false,
+};
+
+/**
+ * 判断错误是否为上游故障（超时、408、5xx、网络断开等）
+ */
+function isUpstreamError(err) {
+  if (!err) return false;
+  const msg = err.message || '';
+  // 客户端超时
+  if (msg.includes('timeout')) return true;
+  // 网络层错误
+  if (msg.includes('ECONNREFUSED') || msg.includes('ECONNRESET') || msg.includes('ENOTFOUND') || msg.includes('EPIPE') || msg.includes('socket hang up')) return true;
+  // HTTP 状态码：408(Request Timeout)、429(Too Many Requests)、5xx(服务器错误)
+  const status = err.response && err.response.status;
+  if (status === 408 || status === 429 || (status >= 500 && status <= 599)) return true;
+  return false;
 }
 
 // 回调队列（scheduler 内部管理）
@@ -212,24 +235,46 @@ async function creditProbe() {
 }
 
 /**
- * 拉取工作线程：串行拉取，避免并发竞争同一个任务
+ * 拉取工作线程：串行拉取，带健康检测 / 降级 / 熔断
  */
 async function pullWorker(workerId) {
   activePullWorkers++;
   while (!workersStopped && !pullingPaused && !autoPaused && !creditExhausted) {
+    // 熔断：上游连续故障过多，暂停等待恢复
+    if (pullHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD) {
+      if (workerId === 0) {
+        logger.warn(`[熔断] 拉取连续故障 ${pullHealth.consecutiveTimeouts} 次，暂停 ${CIRCUIT_BREAK_PAUSE_MS / 1000} 秒`);
+      }
+      await sleep(CIRCUIT_BREAK_PAUSE_MS);
+      pullHealth.consecutiveTimeouts = 0;
+      if (!pullHealth.degraded) {
+        pullHealth.degraded = true;
+        logger.warn(`[熔断→降级] 拉取熔断恢复，进入降级模式`);
+      }
+      continue;
+    }
+
     try {
       const task = await pullSingleTask();
+      recordSample(pullHealth, false, '拉取');
       if (task) {
         pullCount++;
         const added = taskQueue.enqueue([task]);
         if (added === 0) pullDupCount++;
         logTask('pull', true, task.shop_id, task.item_id);
       } else {
-        await sleep(100);
+        // 无任务，短等待
+        await sleep(pullHealth.degraded ? 100 : 30);
       }
     } catch (err) {
+      const upstream = isUpstreamError(err);
+      recordSample(pullHealth, upstream, '拉取');
       logTask('pull', false, '', '');
-      await sleep(300);
+      if (upstream) {
+        logger.warn(`拉取上游故障: ${err.message}`);
+      }
+      // 降级时退避更长
+      await sleep(pullHealth.degraded ? 500 : 100);
     }
   }
   activePullWorkers--;
@@ -272,7 +317,7 @@ async function queryWorker(workerId) {
     }
 
     if (taskQueue.pendingCount === 0) {
-      await sleep(queryHealth.degraded ? 50 : 5);
+      await sleep(queryHealth.degraded ? 10 : 2);
       continue;
     }
 
@@ -302,9 +347,9 @@ function isTaskExpired(task) {
 
 /** 正常模式：批量取任务并发处理 */
 async function queryProcessBatch() {
-  const tasks = taskQueue.dequeue(5);
+  const tasks = taskQueue.dequeue(10);
   if (tasks.length === 0) {
-    await sleep(5);
+    await sleep(2);
     return;
   }
 
@@ -333,8 +378,7 @@ async function queryProcessBatch() {
       }
     } catch (err) {
       logTask('query', false, task.shop_id, task.item_id);
-      const isTimeout = !!(err.message && err.message.includes('timeout'));
-      recordSample(queryHealth, isTimeout, '查询');
+      recordSample(queryHealth, isUpstreamError(err), '查询');
       return { type: 'retry', task };
     }
   });
@@ -358,49 +402,48 @@ async function queryProcessBatch() {
   }
 }
 
-/** 降级模式：串行处理单个任务 */
+/** 降级模式：小批量串行处理 */
 async function queryProcessOne() {
-  const tasks = taskQueue.dequeue(1);
+  const tasks = taskQueue.dequeue(3);
   if (tasks.length === 0) {
-    await sleep(50);
-    return;
-  }
-
-  const task = tasks[0];
-  if (isTaskExpired(task)) return;
-
-  if (task.retry_after && Date.now() < task.retry_after) {
-    taskQueue.requeueSilent(task);
     await sleep(10);
     return;
   }
 
-  try {
-    const result = await querySingle(task);
-    recordSample(queryHealth, false, '查询');
-    if (result.creditExhausted) {
-      taskQueue.removeKey(task);
-      if (!creditExhausted) {
-        creditExhausted = true;
-        creditExhaustedCount++;
-        logger.warn('[额度耗尽] tokege API 额度不足，自动停止拉取和查询，结果已丢弃，每 30 秒探测一次...');
-      }
-      return;
+  for (const task of tasks) {
+    if (isTaskExpired(task)) continue;
+
+    if (task.retry_after && Date.now() < task.retry_after) {
+      taskQueue.requeueSilent(task);
+      continue;
     }
-    if (result.success) {
-      logTask('query', true, task.shop_id, task.item_id);
-      callbackQueue.push({ task: result.task, data: result.data });
-    } else {
+
+    try {
+      const result = await querySingle(task);
+      recordSample(queryHealth, false, '查询');
+      if (result.creditExhausted) {
+        taskQueue.removeKey(task);
+        if (!creditExhausted) {
+          creditExhausted = true;
+          creditExhaustedCount++;
+          logger.warn('[额度耗尽] tokege API 额度不足，自动停止拉取和查询，结果已丢弃，每 30 秒探测一次...');
+        }
+        return;
+      }
+      if (result.success) {
+        logTask('query', true, task.shop_id, task.item_id);
+        callbackQueue.push({ task: result.task, data: result.data });
+      } else {
+        logTask('query', false, task.shop_id, task.item_id);
+        const retryCount = (task.retry_count || 0);
+        task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
+        taskQueue.requeue([task]);
+      }
+    } catch (err) {
       logTask('query', false, task.shop_id, task.item_id);
-      const retryCount = (task.retry_count || 0);
-      task.retry_after = Date.now() + Math.min((retryCount + 1) * 500, 3000);
+      recordSample(queryHealth, isUpstreamError(err), '查询');
       taskQueue.requeue([task]);
     }
-  } catch (err) {
-    logTask('query', false, task.shop_id, task.item_id);
-    const isTimeout = !!(err.message && err.message.includes('timeout'));
-    recordSample(queryHealth, isTimeout, '查询');
-    taskQueue.requeue([task]);
   }
 }
 
@@ -429,7 +472,7 @@ async function callbackWorker(workerId) {
     }
 
     if (callbackQueue.length === 0) {
-      await sleep(callbackHealth.degraded ? 50 : 5);
+      await sleep(callbackHealth.degraded ? 10 : 2);
       continue;
     }
 
@@ -462,7 +505,7 @@ function handleCallbackFailure(item) {
 
 /** 正常模式：批量并发回调 */
 async function callbackProcessBatch() {
-  const batchSize = Math.min(8, callbackQueue.length);
+  const batchSize = Math.min(15, callbackQueue.length);
   const items = [];
   for (let i = 0; i < batchSize; i++) {
     const item = callbackQueue.shift();
@@ -474,14 +517,13 @@ async function callbackProcessBatch() {
     if (isCallbackTaskExpired(item)) return;
 
     try {
-      const ok = await callbackSingle(item.task, item.data);
+      await callbackSingle(item.task, item.data);
       recordSample(callbackHealth, false, '回调');
-      logTask('callback', ok, item.task.shop_id, item.task.item_id);
-      if (!ok) handleCallbackFailure(item);
+      logTask('callback', true, item.task.shop_id, item.task.item_id);
     } catch (err) {
-      const isTimeout = !!(err.message && err.message.includes('timeout'));
-      recordSample(callbackHealth, isTimeout, '回调');
+      recordSample(callbackHealth, isUpstreamError(err), '回调');
       logTask('callback', false, item.task.shop_id, item.task.item_id);
+      logger.warn(`回调失败: shop_id=${item.task.shop_id} good_id=${item.task.good_id} err=${err.message}`);
       handleCallbackFailure(item);
     }
   });
@@ -489,23 +531,29 @@ async function callbackProcessBatch() {
   await Promise.all(promises);
 }
 
-/** 降级模式：串行回调 */
+/** 降级模式：小批量串行回调 */
 async function callbackProcessOne() {
-  const item = callbackQueue.shift();
-  if (!item) return;
+  const batchSize = Math.min(3, callbackQueue.length);
+  const items = [];
+  for (let i = 0; i < batchSize; i++) {
+    const item = callbackQueue.shift();
+    if (item) items.push(item);
+  }
+  if (items.length === 0) return;
 
-  if (isCallbackTaskExpired(item)) return;
+  for (const item of items) {
+    if (isCallbackTaskExpired(item)) continue;
 
-  try {
-    const ok = await callbackSingle(item.task, item.data);
-    recordSample(callbackHealth, false, '回调');
-    logTask('callback', ok, item.task.shop_id, item.task.item_id);
-    if (!ok) handleCallbackFailure(item);
-  } catch (err) {
-    const isTimeout = !!(err.message && err.message.includes('timeout'));
-    recordSample(callbackHealth, isTimeout, '回调');
-    logTask('callback', false, item.task.shop_id, item.task.item_id);
-    handleCallbackFailure(item);
+    try {
+      await callbackSingle(item.task, item.data);
+      recordSample(callbackHealth, false, '回调');
+      logTask('callback', true, item.task.shop_id, item.task.item_id);
+    } catch (err) {
+      recordSample(callbackHealth, isUpstreamError(err), '回调');
+      logTask('callback', false, item.task.shop_id, item.task.item_id);
+      logger.warn(`回调失败: shop_id=${item.task.shop_id} good_id=${item.task.good_id} err=${err.message}`);
+      handleCallbackFailure(item);
+    }
   }
 }
 
@@ -548,8 +596,9 @@ function statsLoop() {
 
   const queryMode = creditExhausted ? '额度耗尽' : queryHealth.degraded ? '降级' : '正常';
   const cbMode = callbackHealth.degraded ? '降级' : '正常';
+  const pullMode = pullHealth.degraded ? '退避' : '正常';
 
-  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers} query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
+  logger.info(`[统计] 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${querySkipCount}(+${deltaSkip}) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
@@ -679,6 +728,7 @@ function getStats() {
     activePullWorkers,
     activeQueryWorkers,
     activeCallbackWorkers,
+    pullDegraded: pullHealth.degraded,
     queryDegraded: queryHealth.degraded,
     callbackDegraded: callbackHealth.degraded,
     callbackQueueLength: callbackQueue.length,

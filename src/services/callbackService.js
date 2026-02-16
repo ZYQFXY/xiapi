@@ -32,34 +32,30 @@ function updateCallbackRate() {
  * @param {Object} task - 任务对象
  * @param {Object} data - tokege 返回的完整数据
  * @returns {boolean} 是否成功
+ * @throws {Error} 网络/服务器错误时抛出，由调用方判断是否为上游故障
  */
 async function callbackSingle(task, data) {
-  try {
-    await uploadClient.post('/task/api/json/upload', {
-      type: task.type,
-      task: {
-        shop_id: task.shop_id,
-        good_id: task.good_id,
-        country: task.country,
-        trace_id: task.trace_id,
-        content: data && data.response ? data.response : data,
-        phone: config.upstream.phone,
-        token: task.token,
-      },
-    }, {
-      timeout: config.callbackTimeout,
-    });
+  await uploadClient.post('/task/api/json/upload', {
+    type: task.type,
+    task: {
+      shop_id: task.shop_id,
+      good_id: task.good_id,
+      country: task.country,
+      trace_id: task.trace_id,
+      content: data && data.response ? data.response : data,
+      phone: config.upstream.phone,
+      token: task.token,
+    },
+  }, {
+    timeout: config.callbackTimeout,
+  });
 
-    // 回调成功，释放去重键
-    taskQueue.removeKey(task);
-    totalSuccessCount++;
-    updateCallbackRate();
-    logger.info(`回调成功: shop_id=${task.shop_id} good_id=${task.good_id} (累计成功: ${totalSuccessCount})`);
-    return true;
-  } catch (err) {
-    logger.warn(`回调失败: shop_id=${task.shop_id} good_id=${task.good_id} err=${err.message}`);
-    return false;
-  }
+  // 回调成功，释放去重键
+  taskQueue.removeKey(task);
+  totalSuccessCount++;
+  updateCallbackRate();
+  logger.info(`回调成功: shop_id=${task.shop_id} good_id=${task.good_id} (累计成功: ${totalSuccessCount})`);
+  return true;
 }
 
 /**
@@ -84,10 +80,11 @@ async function processCallbackQueue() {
     const batch = items.slice(i, i + concurrency);
     await Promise.all(
       batch.map(async ({ task, data }) => {
-        const ok = await callbackSingle(task, data);
-        if (ok) {
+        try {
+          await callbackSingle(task, data);
           succeeded++;
-        } else {
+        } catch (err) {
+          logger.warn(`回调失败: shop_id=${task.shop_id} good_id=${task.good_id} err=${err.message}`);
           retryQueue.push({ task, data, retryCount: 1 });
           failed++;
         }
@@ -128,17 +125,20 @@ async function processRetryQueue() {
     const batch = items.slice(i, i + concurrency);
     await Promise.all(
       batch.map(async (item) => {
-        const ok = await callbackSingle(item.task, item.data);
-        if (ok) {
+        try {
+          await callbackSingle(item.task, item.data);
           succeeded++;
-        } else if (item.retryCount >= maxRetry) {
-          taskQueue.removeKey(item.task);
-          totalDroppedCount++;
-          logger.error(`回调重试超限丢弃: shop_id=${item.task.shop_id} good_id=${item.task.good_id} 已重试${item.retryCount}次`);
-          dropped++;
-        } else {
-          retryQueue.push({ ...item, retryCount: item.retryCount + 1 });
-          failed++;
+        } catch (err) {
+          logger.warn(`回调重试失败: shop_id=${item.task.shop_id} good_id=${item.task.good_id} err=${err.message}`);
+          if (item.retryCount >= maxRetry) {
+            taskQueue.removeKey(item.task);
+            totalDroppedCount++;
+            logger.error(`回调重试超限丢弃: shop_id=${item.task.shop_id} good_id=${item.task.good_id} 已重试${item.retryCount}次`);
+            dropped++;
+          } else {
+            retryQueue.push({ ...item, retryCount: item.retryCount + 1 });
+            failed++;
+          }
         }
       })
     );
