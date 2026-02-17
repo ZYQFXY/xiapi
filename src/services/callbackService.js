@@ -41,7 +41,9 @@ async function callbackSingle(task, data) {
     result: JSON.stringify(result),
   }, {
     headers: {
-      Authorization: `Bearer ${task.token}`,
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${task.token}`,
+      'Accept': '*/*',
     },
     timeout: config.callbackTimeout,
   });
