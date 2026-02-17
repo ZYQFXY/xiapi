@@ -64,7 +64,7 @@ async function fetchCredits() {
   try {
     const res = await tokegeClient.get('/tokens/credits', { timeout: 10000 });
     if (res.data && res.data._success && Array.isArray(res.data.credits) && res.data.credits.length > 0) {
-      tokegeCredits = Math.abs(res.data.credits[0].credit);
+      tokegeCredits = res.data.credits[0].credit;
       if (tokegeInitialCredits === null) {
         tokegeInitialCredits = tokegeCredits;
       }
