@@ -49,9 +49,9 @@ async function fetchCurnum() {
   }
 }
 
-function startCurnumPolling() {
-  fetchCurnum();
-  curnumTimer = setInterval(fetchCurnum, 5000);
+async function startCurnumPolling() {
+  await fetchCurnum(); // 首次同步获取，确保有初始数据
+  curnumTimer = setInterval(fetchCurnum, 30000); // 30秒轮询一次，避免频率限制
 }
 
 startCurnumPolling();
@@ -111,13 +111,13 @@ function setupWebSocket(server) {
     const taskHistory = scheduler.getTaskLogHistory();
     safeSend(ws, JSON.stringify({ type: 'taskLogs', data: taskHistory }));
 
-    // 客户端刚连接，立即刷新 curnum 和余额并推送最新统计
-    Promise.all([fetchCurnum(), fetchCredits()]).then(() => {
-      try {
-        const stats = collectStats();
-        safeSend(ws, JSON.stringify({ type: 'stats', data: stats }));
-      } catch (err) {}
-    });
+    // 客户端刚连接，立即推送当前统计（使用已缓存的 curnum 和余额数据）
+    try {
+      const stats = collectStats();
+      safeSend(ws, JSON.stringify({ type: 'stats', data: stats }));
+    } catch (err) {
+      logger.warn(`推送初始统计失败: ${err.message}`);
+    }
 
     ws.on('message', (raw) => {
       try {
@@ -237,6 +237,11 @@ function handleCommand(command) {
     case 'stopPulling':
       scheduler.stopPulling();
       logger.info('[控制] Web 面板停止拉取');
+      break;
+    case 'shutdown':
+      logger.info('[控制] Web 面板请求终止服务');
+      scheduler.stop();
+      setTimeout(() => process.exit(0), 500);
       break;
     default:
       logger.warn(`未知控制命令: ${command}`);

@@ -18,16 +18,16 @@ function updatePullRate() {
 
 /**
  * 从上游批量拉取任务
- * GET /api/get/task?phone=xxx&size=N
+ * GET /api/get/tasks?phone=xxx&limit=N
  * @param {number} size - 批量拉取数量
  * @returns {Array} 转换后的任务对象数组，无任务返回空数组
  * @throws {Error} 网络/服务器错误时抛出，由调用方处理
  */
 async function pullBatchTask(size) {
-  const res = await pullClient.get('/api/get/task', {
+  const res = await pullClient.get('/api/get/tasks', {
     params: {
       phone: config.upstream.phone,
-      size: size || config.scheduler.batchSize,
+      limit: size || config.scheduler.batchSize,
     },
   });
 

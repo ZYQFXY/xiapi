@@ -6,10 +6,11 @@ module.exports = {
 
   upstream: {
     pullBaseUrl: process.env.UPSTREAM_PULL_URL || 'http://103.207.68.206:3000',
-    uploadBaseUrl: process.env.UPSTREAM_UPLOAD_URL || 'http://103.207.68.206:9000',
+    uploadBaseUrl: process.env.UPSTREAM_UPLOAD_URL || 'https://zb2.eqwofaygdsjko.uk',
     phone: process.env.PHONE || '18888888888',
     country: process.env.COUNTRY || 'tw',
     curnumBaseUrl: process.env.CURNUM_BASE_URL || 'http://103.207.68.206:3600',
+    curnumApiPath: process.env.CURNUM_API_PATH || '/api/curnum',
   },
 
   tokege: {

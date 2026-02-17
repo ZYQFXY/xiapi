@@ -25,25 +25,24 @@ function updateCallbackRate() {
 
 /**
  * 回调单个结果
- * POST /task/api/json/upload
+ * POST /api/task/submit/v2
  * @param {Object} task - 任务对象
  * @param {Object} data - tokege 返回的完整数据
  * @returns {boolean} 是否成功
  * @throws {Error} 网络/服务器错误时抛出，由调用方判断是否为上游故障
  */
 async function callbackSingle(task, data) {
-  await uploadClient.post('/task/api/json/upload', {
-    type: task.type,
-    task: {
-      shop_id: task.shop_id,
-      good_id: task.good_id,
-      country: task.country,
-      trace_id: task.trace_id,
-      content: data && data.response ? data.response : data,
-      phone: config.upstream.phone,
-      token: task.token,
-    },
+  const url = `https://shopee.${task.country}/api/v4/pdp/get_pc?display_model_id=0&item_id=${task.item_id}&model_selection_logic=3&shop_id=${task.shop_id}&tz_offset_in_minutes=480&detail_level=0`;
+  const result = data && data.response ? data.response : data;
+
+  await uploadClient.post('/api/task/submit/v2', {
+    appVersion: 'vv2',
+    url,
+    result: JSON.stringify(result),
   }, {
+    headers: {
+      Authorization: `Bearer ${task.token}`,
+    },
     timeout: config.callbackTimeout,
   });
 
