@@ -17,7 +17,7 @@ let lastLogIndex = 0;
 
 const MAX_LOGS_PER_BROADCAST = 50;
 
-const HEARTBEAT_INTERVAL = 30000; // 30秒发一次心跳
+const HEARTBEAT_INTERVAL = 15000; // 15秒发一次心跳
 
 // ======== curnum 当天任务量轮询 ========
 const curnumData = { initial: null, current: 0, sessionIncrement: 0 };

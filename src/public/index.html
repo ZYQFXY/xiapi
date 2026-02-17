@@ -206,8 +206,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 var ws = null;
 var startTime = Date.now();
 var reconnectTimer = null;
-var reconnectDelay = 3000;
-var maxReconnectDelay = 30000;
+var reconnectDelay = 1000;
 var connecting = false;
 
 var pendingStats = null;
@@ -215,6 +214,12 @@ var pendingSysLogs = [];
 var pendingTaskLogs = { pull: [], query: [], callback: [] };
 var rafId = null;
 var MAX_LINES = 150;
+
+// 去重追踪：防止重连时日志重复
+var lastTaskLogTs = { pull: 0, query: 0, callback: 0 };
+var processedSysLogs = {};
+var processedSysLogCount = 0;
+var MAX_PROCESSED_LOGS = 300;
 
 function $(id) { return document.getElementById(id); }
 
@@ -472,7 +477,11 @@ function bufferTaskLogs(data) {
     var ch = channels[c];
     if (data[ch] && data[ch].length) {
       for (var i = 0; i < data[ch].length; i++) {
-        pendingTaskLogs[ch].push(data[ch][i]);
+        var entry = data[ch][i];
+        // 按时间戳去重，跳过重连时服务端重复推送的旧日志
+        if (entry.ts && entry.ts <= lastTaskLogTs[ch]) continue;
+        pendingTaskLogs[ch].push(entry);
+        if (entry.ts) lastTaskLogTs[ch] = entry.ts;
       }
       if (pendingTaskLogs[ch].length > MAX_LINES) {
         pendingTaskLogs[ch] = pendingTaskLogs[ch].slice(-MAX_LINES);
@@ -482,14 +491,31 @@ function bufferTaskLogs(data) {
 }
 
 // ======== WebSocket 连接 ========
+var lastMessageTime = 0;       // 上次收到消息的时间戳
+var STALE_TIMEOUT = 5000;      // 5秒没收到消息判定连接失效（服务端每秒推送）
+var watchdogTimer = null;
+
 function sendCmd(cmd) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'command', command: cmd }));
   }
 }
 
+function forceReconnect() {
+  if (ws) {
+    try { ws.onclose = null; ws.onerror = null; ws.close(); } catch (e) {}
+    ws = null;
+  }
+  connecting = false;
+  setConnected(false);
+  reconnectDelay = 1000;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  connect();
+}
+
 function connect() {
   if (connecting) return;
+  if (ws && ws.readyState === WebSocket.OPEN) return;
   connecting = true;
 
   if (ws) {
@@ -509,12 +535,14 @@ function connect() {
 
   ws.onopen = function() {
     connecting = false;
-    reconnectDelay = 3000;
+    reconnectDelay = 1000;
+    lastMessageTime = Date.now();
     setConnected(true);
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   };
 
   ws.onmessage = function(e) {
+    lastMessageTime = Date.now();
     try {
       var msg = JSON.parse(e.data);
       if (msg.type === 'stats') {
@@ -522,7 +550,18 @@ function connect() {
       } else if (msg.type === 'taskLogs') {
         bufferTaskLogs(msg.data);
       } else if (msg.type === 'logs') {
-        for (var i = 0; i < msg.data.length; i++) pendingSysLogs.push(msg.data[i]);
+        for (var i = 0; i < msg.data.length; i++) {
+          var logLine = msg.data[i];
+          if (processedSysLogs[logLine]) continue; // 跳过已处理的重复日志
+          processedSysLogs[logLine] = 1;
+          processedSysLogCount++;
+          pendingSysLogs.push(logLine);
+        }
+        // 防止去重表无限增长
+        if (processedSysLogCount > MAX_PROCESSED_LOGS) {
+          processedSysLogs = {};
+          processedSysLogCount = 0;
+        }
         if (pendingSysLogs.length > MAX_LINES) pendingSysLogs = pendingSysLogs.slice(-MAX_LINES);
       }
       scheduleRender();
@@ -538,6 +577,7 @@ function connect() {
   ws.onerror = function() {
     connecting = false;
     setConnected(false);
+    scheduleReconnect();
   };
 }
 
@@ -547,8 +587,42 @@ function scheduleReconnect() {
     reconnectTimer = null;
     connect();
   }, reconnectDelay);
-  reconnectDelay = Math.min(reconnectDelay * 2, maxReconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 1.5, 10000);
 }
+
+// 客户端看门狗：每3秒检查是否长时间没收到消息
+watchdogTimer = setInterval(function() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (lastMessageTime > 0 && (Date.now() - lastMessageTime) > STALE_TIMEOUT) {
+    forceReconnect();
+  }
+}, 3000);
+
+// 页面可见性变化：标签页从后台切回时立即检测并重连
+document.addEventListener('visibilitychange', function() {
+  if (document.hidden) return;
+  // 页面变为可见，检查连接状态
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    // 连接已断，立即重连
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    reconnectDelay = 1000;
+    connecting = false;
+    connect();
+  } else if (lastMessageTime > 0 && (Date.now() - lastMessageTime) > STALE_TIMEOUT) {
+    // 连接看似在但已经静默死亡
+    forceReconnect();
+  }
+});
+
+// 网络恢复时立即重连
+window.addEventListener('online', function() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    reconnectDelay = 1000;
+    connecting = false;
+    connect();
+  }
+});
 
 connect();
 </script>
