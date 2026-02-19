@@ -1,6 +1,6 @@
 // 在桌面创建快捷方式，指向当前项目的 launch.vbs
 // 用法: node create-shortcut.js [快捷方式名称]
-// 示例: node create-shortcut.js 2号客户接口2
+// 示例: node create-shortcut.js 3号客户
 
 const fs = require('fs');
 const path = require('path');
