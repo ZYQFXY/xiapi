@@ -4,8 +4,8 @@ Set objFSO = CreateObject("Scripting.FileSystemObject")
 ' 获取脚本所在目录
 strDir = objFSO.GetParentFolderName(WScript.ScriptFullName)
 
-' 检查端口 3000 是否已被占用
-Set objExec = objShell.Exec("cmd /c netstat -ano | findstr :3000 | findstr LISTENING")
+' 检查端口 3003 是否已被占用
+Set objExec = objShell.Exec("cmd /c netstat -ano | findstr :3003 | findstr LISTENING")
 strOutput = ""
 Do While Not objExec.StdOut.AtEndOfStream
     strOutput = strOutput & objExec.StdOut.ReadLine()
@@ -27,4 +27,4 @@ objShell.Run "cmd /c node src/index.js", 0, False
 WScript.Sleep 2500
 
 ' 打开浏览器
-objShell.Run "http://localhost:3000", 1, False
+objShell.Run "http://localhost:3003", 1, False

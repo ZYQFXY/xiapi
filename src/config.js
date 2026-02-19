@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 module.exports = {
-  port: parseInt(process.env.PORT, 10) || 3000,
+  port: parseInt(process.env.PORT, 10) || 3003,
   logLevel: process.env.LOG_LEVEL || 'info',
 
   upstream: {
