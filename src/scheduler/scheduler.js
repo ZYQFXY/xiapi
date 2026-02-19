@@ -225,7 +225,7 @@ async function sendWecomAlert(message) {
  * 丢弃率 = 超时丢弃任务 / (回调成功 + 超时丢弃)
  */
 function checkTimeoutDiscardRate() {
-  const totalDiscards = querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
+  const totalDiscards = queryStaleCount + querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
   const successCount = getTotalSuccessCount();
   const total = successCount + totalDiscards;
   if (total < DISCARD_CHECK_MIN_TOTAL) return;
@@ -504,7 +504,7 @@ async function queryWorker(workerId) {
   activeQueryWorkers--;
 }
 
-/** 检查任务是否查询前过期（>4分钟），不计入超时丢弃率 */
+/** 检查任务是否查询前过期（>4分钟），计入超时丢弃率 */
 function isTaskStale(task) {
   if (!task.created_at) return false;
   const age = Date.now() - new Date(task.created_at).getTime();
@@ -823,7 +823,7 @@ function statsLoop() {
   const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
   const deltaTimeout = queueTimeoutCount - lastStatsQueueTimeoutCount;
 
-  const totalDiscards = querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
+  const totalDiscards = queryStaleCount + querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
   const discardTotal = currentSuccess + totalDiscards;
   const discardRate = discardTotal > 0 ? (totalDiscards / discardTotal * 100).toFixed(1) : '0.0';
 
@@ -969,7 +969,7 @@ function getStats() {
   const callbackMode = callbackHealth.consecutiveTimeouts >= CIRCUIT_BREAK_THRESHOLD ? '熔断'
     : callbackHealth.degraded ? '降级' : '正常';
 
-  const totalDiscards = querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
+  const totalDiscards = queryStaleCount + querySkipCount + queueTimeoutCount + callbackTimeoutDiscards + getTotalDroppedCount();
   const successCount = getTotalSuccessCount();
   const discardTotal = successCount + totalDiscards;
   const discardRate = discardTotal > 0 ? (totalDiscards / discardTotal * 100).toFixed(1) : '0.0';
