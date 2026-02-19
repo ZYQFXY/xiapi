@@ -25,8 +25,8 @@ let hardStopped = false;            // 超时丢弃>20%紧急停止，不可自�
 let highWaterAlertSent = false;     // 高水位告警已发送标记
 
 // 队列背压阈值
-const QUEUE_HIGH_WATER = 800;
-const QUEUE_LOW_WATER = 100;
+const QUEUE_HIGH_WATER = 200;
+const QUEUE_LOW_WATER = 50;
 
 // ======== 外部 API 健康检测 & 自动降级 ========
 const HEALTH_WINDOW_MS = 60000;       // 60 秒统计窗口
@@ -303,6 +303,11 @@ function checkBackpressure() {
     autoPaused = false;
     highWaterAlertSent = false;
     logger.info(`=== 队列恢复 === 堆积任务 ${pending} 低于 ${QUEUE_LOW_WATER}，自动恢复拉取`);
+    sendWecomAlert(
+      `✅ 虾皮任务系统队列恢复\n\n` +
+      `队列剩余任务: ${pending}（低水位阈值 ${QUEUE_LOW_WATER}）\n` +
+      `系统已自动恢复拉取任务。`
+    );
     // 补足已退出的拉取线程
     const pullNeeded = config.scheduler.pullSize - activePullWorkers;
     for (let i = 0; i < pullNeeded; i++) {

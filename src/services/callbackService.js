@@ -2,6 +2,7 @@ const { uploadClient } = require('../utils/http');
 const config = require('../config');
 const logger = require('../utils/logger');
 const taskQueue = require('../queue/taskQueue');
+const auditService = require('./auditService');
 
 // 回调待处理队列: [{ task, data }]
 const callbackQueue = [];
@@ -52,6 +53,7 @@ async function callbackSingle(task, data) {
   taskQueue.removeKey(task);
   totalSuccessCount++;
   updateCallbackRate();
+  auditService.record(task);
   logger.info(`回调成功: shop_id=${task.shop_id} good_id=${task.good_id} (累计成功: ${totalSuccessCount})`);
   return true;
 }

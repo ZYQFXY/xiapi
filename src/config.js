@@ -40,6 +40,22 @@ module.exports = {
     webhookKey: process.env.WECOM_WEBHOOK_KEY || '',
   },
 
+  redis: {
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: parseInt(process.env.REDIS_PORT, 10) || 6379,
+    password: process.env.REDIS_PASSWORD || undefined,
+    db: parseInt(process.env.REDIS_DB, 10) || 0,
+  },
+
+  postgres: {
+    host: process.env.PG_HOST || '127.0.0.1',
+    port: parseInt(process.env.PG_PORT, 10) || 5432,
+    user: process.env.PG_USER || 'postgres',
+    password: process.env.PG_PASSWORD || 'postgres',
+    database: process.env.PG_DATABASE || 'xiapi',
+    max: 10,
+  },
+
   httpTimeout: parseInt(process.env.HTTP_TIMEOUT, 10) || 30000,
   pullTimeout: parseInt(process.env.PULL_TIMEOUT, 10) || 15000,
   callbackTimeout: 0,
