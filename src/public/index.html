@@ -153,9 +153,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
   <div class="panel">
     <h3>队列状态 <span class="rate-value" id="s-pull-rate">0</span> 条/分</h3>
     <div class="stat-row"><span class="stat-label">待处理任务</span><span class="stat-value" id="s-q-pending">0</span></div>
-    <div class="stat-row"><span class="stat-label">在途去重键</span><span class="stat-value" id="s-q-dedupe">0</span></div>
-    <div class="stat-row"><span class="stat-label">已处理(永久去重)</span><span class="stat-value" id="s-q-processed">0</span></div>
-    <div class="stat-row"><span class="stat-label">拉取去重(丢弃)</span><span class="stat-value" id="s-pull-dup">0</span></div>
     <div class="stat-row"><span class="stat-label">超时丢弃</span><span class="stat-value" id="s-query-skip">0</span></div>
     <div class="stat-row"><span class="stat-label">查询前过期</span><span class="stat-value" id="s-query-stale">0</span></div>
     <div class="stat-row"><span class="stat-label">队列中超时</span><span class="stat-value" id="s-queue-timeout">0</span></div>
@@ -294,12 +291,9 @@ function updateStats(data) {
 
   if (data.queueStats) {
     $('s-q-pending').textContent = data.queueStats.pending || 0;
-    $('s-q-dedupe').textContent = data.queueStats.dedupeKeys || 0;
-    $('s-q-processed').textContent = data.queueStats.processedKeys || 0;
   }
 
   if (data.schedulerStats) {
-    $('s-pull-dup').textContent = data.schedulerStats.pullDupCount || 0;
     $('s-query-skip').textContent = data.schedulerStats.querySkipCount || 0;
     $('s-query-stale').textContent = data.schedulerStats.queryStaleCount || 0;
     $('s-queue-timeout').textContent = data.schedulerStats.queueTimeoutCount || 0;

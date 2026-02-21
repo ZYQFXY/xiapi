@@ -148,7 +148,6 @@ const callbackQueue = [];
 let statsLastTime = Date.now();
 let statsLastSuccess = 0;
 let pullCount = 0;
-let pullDupCount = 0;
 let querySkipCount = 0;
 let queueTimeoutCount = 0;  // 队列中超时统计
 let creditExhaustedCount = 0;  // 额度耗尽触发次数
@@ -159,7 +158,6 @@ let discardCircuitTriggered = false;  // 丢弃率熔断已触发
 
 // 上次统计输出时的快照（用于计算增量）
 let lastStatsPullCount = 0;
-let lastStatsPullDupCount = 0;
 let lastStatsQuerySkipCount = 0;
 let lastStatsQueueTimeoutCount = 0;
 
@@ -402,8 +400,7 @@ async function pullWorker(workerId) {
         recordSample(pullHealth, false, '拉取');
         if (task) {
           pullCount++;
-          const added = taskQueue.enqueue([task]);
-          if (added === 0) pullDupCount++;
+          taskQueue.enqueue([task]);
           logTask('pull', true, task.shop_id, task.item_id);
         } else {
           await sleep(100);
@@ -433,8 +430,7 @@ async function pullWorker(workerId) {
           if (r.task) {
             gotTask = true;
             pullCount++;
-            const added = taskQueue.enqueue([r.task]);
-            if (added === 0) pullDupCount++;
+            taskQueue.enqueue([r.task]);
             logTask('pull', true, r.task.shop_id, r.task.item_id);
           }
         } else {
@@ -549,13 +545,6 @@ async function queryProcessBatch() {
   const promises = tasks.map(async (task) => {
     if (isTaskStale(task)) return null;
 
-    // 二次拦截：任务已被处理过（回调成功/丢弃），跳过查询
-    if (taskQueue.isProcessed(task)) {
-      taskQueue.removeKey(task);
-      pullDupCount++;
-      return null;
-    }
-
     if (task.retry_after && Date.now() < task.retry_after) {
       taskQueue.requeueSilent(task);
       return null;
@@ -617,13 +606,6 @@ async function queryProcessOne() {
 
   for (const task of tasks) {
     if (isTaskStale(task)) continue;
-
-    // 二次拦截：任务已被处理过（回调成功/丢弃），跳过查询
-    if (taskQueue.isProcessed(task)) {
-      taskQueue.removeKey(task);
-      pullDupCount++;
-      continue;
-    }
 
     if (task.retry_after && Date.now() < task.retry_after) {
       taskQueue.requeueSilent(task);
@@ -824,7 +806,6 @@ function statsLoop() {
   const rate = (delta / elapsed * 60).toFixed(1);
 
   const deltaPull = pullCount - lastStatsPullCount;
-  const deltaDup = pullDupCount - lastStatsPullDupCount;
   const deltaSkip = querySkipCount - lastStatsQuerySkipCount;
   const deltaTimeout = queueTimeoutCount - lastStatsQueueTimeoutCount;
 
@@ -839,12 +820,11 @@ function statsLoop() {
   const globalTag = globalLevel >= 2 ? ` [全局降级L${globalLevel}]` : '';
   const hardTag = hardStopped ? ' [紧急停止]' : '';
 
-  logger.info(`[统计]${globalTag}${hardTag} 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 去重: ${pullDupCount}(+${deltaDup}) 超时丢弃: ${totalDiscards}(${discardRate}%) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
+  logger.info(`[统计]${globalTag}${hardTag} 回调: ${currentSuccess} (+${delta}) ${rate}条/分 | 拉取: ${pullCount}(+${deltaPull}) 超时丢弃: ${totalDiscards}(${discardRate}%) 队列中超时: ${queueTimeoutCount}(+${deltaTimeout}) | 队列: ${taskQueue.pendingCount} | 回调队列: ${callbackQueue.length} | 重试: ${getRetryQueueLength()} | pull=${activePullWorkers}(${pullMode}) query=${activeQueryWorkers}(${queryMode}) cb=${activeCallbackWorkers}(${cbMode})`);
 
   statsLastTime = now;
   statsLastSuccess = currentSuccess;
   lastStatsPullCount = pullCount;
-  lastStatsPullDupCount = pullDupCount;
   lastStatsQuerySkipCount = querySkipCount;
   lastStatsQueueTimeoutCount = queueTimeoutCount;
 }
@@ -996,7 +976,6 @@ function getStats() {
     callbackDegraded: callbackHealth.degraded,
     callbackQueueLength: callbackQueue.length,
     pullCount,
-    pullDupCount,
     querySkipCount,
     queryStaleCount,
     queueTimeoutCount,
